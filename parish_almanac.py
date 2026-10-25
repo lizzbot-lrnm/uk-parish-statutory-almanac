@@ -1094,6 +1094,8 @@ def search_uk_rro_precedents(
     mitigation: str = "",
     max_pct: float | None = None,
     limit: int = 25,
+    *,
+    export_format: str = "json",
 ) -> dict[str, Any]:
     """
     Search the read-only (`?mode=ro`) SQLite FTS5 + deterministic vector index of 80 real
@@ -1114,6 +1116,7 @@ def search_uk_rro_precedents(
         mitigation=mitigation,
         max_pct=max_pct,
         limit=limit,
+        export_format=export_format,
     )
 
 
@@ -1142,3 +1145,33 @@ def audit_private_rro_claim_or_pdf(
         region_hint=region_hint,
         claimed_gbp_hint=claimed_gbp_hint,
     )
+
+
+def get_uk_rro_usage_stats() -> dict[str, Any]:
+    """
+    Return privacy-safe aggregate North Star usage counters and explicit zero-PII attestations.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import get_rro_usage_stats as _stats_impl
+
+    return _stats_impl()
+
+
+def record_uk_rro_usage_event(event_type: str) -> dict[str, Any]:
+    """
+    Increment a privacy-safe aggregate RRO usage counter ("search", "pack_download", "private_audit").
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import record_rro_usage_event as _rec_impl
+
+    return _rec_impl(event_type=event_type)

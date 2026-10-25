@@ -281,3 +281,21 @@ def test_parish_almanac_rro_precedent_finder_and_ephemeral_audit() -> None:
     assert audit["public_db_mode"] == "OGL-v3.0-read-only"
     assert audit["private_claim_summary"]["claimed_gbp_evaluated"] == 18000.0
     assert len(audit["comparable_ogl_precedents"]) >= 3
+
+
+def test_parish_almanac_rro_usage_stats_zero_pii() -> None:
+    stats_before = pa.get_uk_rro_usage_stats()
+    assert stats_before["status"] == "ok"
+    assert stats_before["privacy_mode"] == "aggregate-counters-only-zero-pii"
+    assert stats_before["stores_ip_addresses"] is False
+    assert stats_before["stores_search_queries"] is False
+    assert stats_before["stores_uploaded_pdfs"] is False
+    assert stats_before["ogl_reference_db_mode"] == "OGL-v3.0-read-only"
+    assert stats_before["private_pdf_audit_mode"] == "stateless-ephemeral-finally-wiped"
+    assert stats_before["corpus_size"] == 80
+
+    pa.search_uk_rro_precedents(q="Ealing", export_format="csv")
+    stats_after = pa.get_uk_rro_usage_stats()
+    assert stats_after["total_pack_downloads"] == stats_before["total_pack_downloads"] + 1
+    assert "north_star_7d_targets" in stats_after
+    assert "progress_pct" in stats_after

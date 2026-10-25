@@ -1422,6 +1422,144 @@ function auditPrivateRroClaimEdge(payload = {}) {
   }
 }
 
+
+const RRO_STATS_CACHE_URL = "https://parish.technoplusit.co.uk/__internal_rro_stats_v1";
+const RRO_ALLOWED_EVENTS = new Set(["search", "pack_download", "private_audit"]);
+const RRO_EDGE_COUNTERS = {
+  daily_totals: {},
+};
+
+function mergeRroDailyTotals(targetDaily, incomingDaily) {
+  if (!incomingDaily || typeof incomingDaily !== "object") return;
+  for (const [day, bucket] of Object.entries(incomingDaily)) {
+    if (!bucket || typeof bucket !== "object") continue;
+    if (!targetDaily[day]) {
+      targetDaily[day] = { searches: 0, pack_downloads: 0, private_audits: 0 };
+    }
+    targetDaily[day].searches = Math.max(
+      Number(targetDaily[day].searches || 0),
+      Number(bucket.searches || 0)
+    );
+    targetDaily[day].pack_downloads = Math.max(
+      Number(targetDaily[day].pack_downloads || 0),
+      Number(bucket.pack_downloads || 0)
+    );
+    targetDaily[day].private_audits = Math.max(
+      Number(targetDaily[day].private_audits || 0),
+      Number(bucket.private_audits || 0)
+    );
+  }
+}
+
+async function syncRroEdgeCountersFromCache() {
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const cachedResp = await caches.default.match(RRO_STATS_CACHE_URL);
+      if (cachedResp) {
+        const data = await cachedResp.json();
+        if (data && data.daily_totals) {
+          mergeRroDailyTotals(RRO_EDGE_COUNTERS.daily_totals, data.daily_totals);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
+async function persistRroEdgeCountersToCache() {
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const snapshot = JSON.stringify({ daily_totals: RRO_EDGE_COUNTERS.daily_totals });
+      await caches.default.put(
+        RRO_STATS_CACHE_URL,
+        new Response(snapshot, {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=604800",
+          },
+        })
+      );
+    }
+  } catch (_) {}
+}
+
+function buildRroStatsPayload() {
+  let totalSearches = 0;
+  let totalPackDownloads = 0;
+  let totalPrivateAudits = 0;
+  const sortedDays = Object.keys(RRO_EDGE_COUNTERS.daily_totals).sort();
+  const dailyTotalsOut = {};
+  for (const day of sortedDays) {
+    const b = RRO_EDGE_COUNTERS.daily_totals[day] || {};
+    const s = Number(b.searches || 0);
+    const p = Number(b.pack_downloads || 0);
+    const a = Number(b.private_audits || 0);
+    totalSearches += s;
+    totalPackDownloads += p;
+    totalPrivateAudits += a;
+    dailyTotalsOut[day] = {
+      searches: s,
+      pack_downloads: p,
+      private_audits: a,
+    };
+  }
+  const searchesTarget = 100;
+  const packDownloadsTarget = 10;
+  const paidPackPriceGbp = 29;
+  return {
+    status: "ok",
+    service: "uk-property-tribunal-rro-precedent-finder",
+    privacy_mode: "aggregate-counters-only-zero-pii",
+    stores_ip_addresses: false,
+    stores_search_queries: false,
+    stores_uploaded_pdfs: false,
+    ogl_reference_db_mode: "OGL-v3.0-read-only",
+    private_pdf_audit_mode: "stateless-ephemeral-finally-wiped",
+    corpus_size: RRO_PRECEDENTS.length,
+    total_searches: totalSearches,
+    total_pack_downloads: totalPackDownloads,
+    total_private_audits: totalPrivateAudits,
+    daily_totals: dailyTotalsOut,
+    north_star_7d_targets: {
+      searches_target: searchesTarget,
+      pack_downloads_target: packDownloadsTarget,
+      paid_pack_price_gbp: paidPackPriceGbp,
+    },
+    progress_pct: {
+      searches_pct: Math.min(100.0, Math.round((totalSearches / searchesTarget) * 1000) / 10),
+      pack_downloads_pct: Math.min(100.0, Math.round((totalPackDownloads / packDownloadsTarget) * 1000) / 10),
+    },
+  };
+}
+
+async function recordRroEdgeEvent(eventType) {
+  if (!RRO_ALLOWED_EVENTS.has(eventType)) {
+    throw new Error("Unsupported RRO usage eventType");
+  }
+  await syncRroEdgeCountersFromCache();
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  if (!RRO_EDGE_COUNTERS.daily_totals[todayUtc]) {
+    RRO_EDGE_COUNTERS.daily_totals[todayUtc] = {
+      searches: 0,
+      pack_downloads: 0,
+      private_audits: 0,
+    };
+  }
+  if (eventType === "search") {
+    RRO_EDGE_COUNTERS.daily_totals[todayUtc].searches += 1;
+  } else if (eventType === "pack_download") {
+    RRO_EDGE_COUNTERS.daily_totals[todayUtc].pack_downloads += 1;
+  } else if (eventType === "private_audit") {
+    RRO_EDGE_COUNTERS.daily_totals[todayUtc].private_audits += 1;
+  }
+  await persistRroEdgeCountersToCache();
+  return buildRroStatsPayload();
+}
+
+async function getRroEdgeStats() {
+  await syncRroEdgeCountersFromCache();
+  return buildRroStatsPayload();
+}
+
 function exportRroPrecedentsCsv(records) {
   const headers = [
     "case_ref", "region", "decision_date", "offence_type",
@@ -1502,7 +1640,8 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <div>
           <a href="/">← Back to UK Statutory Almanac</a> &nbsp;|&nbsp;
           <a href="/api/rro-search?format=csv">Download Regional Precedent Pack (CSV)</a> &nbsp;|&nbsp;
-          <a href="/api/rro-search">JSON API</a>
+          <a href="/api/rro-search">JSON API</a> &nbsp;|&nbsp;
+          <a href="/rro/stats">Live North Star Stats (Zero-PII)</a>
         </div>
       </div>
       <h1>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</h1>
@@ -1512,6 +1651,7 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <span class="badge">Read-Only (?mode=ro) OGL v3.0 Reference Index</span>
         <span class="badge">Stateless Ephemeral Private Claim Auditor (finally: wiped)</span>
         <span class="badge">0 LLM Tokens · Deterministic PDF Ligature Recovery</span>
+        <a href="/rro/stats" class="badge" id="northStarBadge" style="text-decoration:none;background:#0d9488;color:#fff;font-weight:700;">7-Day North Star Gate: Live Zero-PII Stats ↗</a>
       </div>
     </div>
   </header>
@@ -1687,9 +1827,29 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
     document.getElementById("region").addEventListener("change", runRroSearch);
     document.getElementById("offence").addEventListener("change", runRroSearch);
     document.getElementById("mitigation").addEventListener("change", runRroSearch);
-    document.getElementById("auditBtn").addEventListener("click", runPrivateAudit);
-    runRroSearch();
-    runPrivateAudit();
+    async function refreshNorthStarBadge() {
+      try {
+        const r = await fetch("/api/rro/stats");
+        const s = await r.json();
+        const el = document.getElementById("northStarBadge");
+        if (el && s && s.status === "ok") {
+          el.textContent = "7-Day North Star Gate: " + s.total_searches + "/100 Searches · " + s.total_pack_downloads + "/10 Pack Downloads · " + s.total_private_audits + " Audits (Zero-PII JSON ↗)";
+        }
+      } catch (_) {}
+    }
+
+    document.getElementById("auditBtn").addEventListener("click", async () => {
+      await runPrivateAudit();
+      await refreshNorthStarBadge();
+    });
+    document.getElementById("searchBtn").addEventListener("click", async () => {
+      await refreshNorthStarBadge();
+    });
+    (async () => {
+      await runRroSearch();
+      await runPrivateAudit();
+      await refreshNorthStarBadge();
+    })();
   </script>
 </body>
 </html>`;
@@ -1713,6 +1873,22 @@ export default {
       });
     }
 
+    if (
+      url.pathname === "/rro/stats" ||
+      url.pathname === "/rro/stats/" ||
+      url.pathname === "/api/rro/stats" ||
+      url.pathname === "/api/rro/stats/" ||
+      url.pathname === "/api/rro-stats"
+    ) {
+      const statsPayload = await getRroEdgeStats();
+      return Response.json(statsPayload, {
+        headers: {
+          ...corsHeaders,
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+      });
+    }
+
     if (url.pathname === "/api/rro-search") {
       let params = {
         q: url.searchParams.get("q") || "",
@@ -1731,6 +1907,7 @@ export default {
       }
       const res = searchRroPrecedentsEdge(params);
       if (String(params.format).toLowerCase() === "csv") {
+        await recordRroEdgeEvent("pack_download");
         const csvText = exportRroPrecedentsCsv(res.results);
         return new Response(csvText, {
           headers: {
@@ -1740,6 +1917,7 @@ export default {
           },
         });
       }
+      await recordRroEdgeEvent("search");
       return Response.json(res, { headers: corsHeaders });
     }
 
@@ -1759,7 +1937,9 @@ export default {
           payload.claim_text = rawBody;
         }
       }
-      return Response.json(auditPrivateRroClaimEdge(payload), { headers: corsHeaders });
+      const auditRes = auditPrivateRroClaimEdge(payload);
+      await recordRroEdgeEvent("private_audit");
+      return Response.json(auditRes, { headers: corsHeaders });
     }
 
     if (url.pathname === "/llms.txt") {
