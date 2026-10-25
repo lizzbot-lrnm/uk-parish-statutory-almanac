@@ -1096,9 +1096,10 @@ def search_uk_rro_precedents(
     limit: int = 25,
     *,
     export_format: str = "json",
+    internal: bool = False,
 ) -> dict[str, Any]:
     """
-    Search the read-only (`?mode=ro`) SQLite FTS5 + deterministic vector index of 80 real
+    Search the read-only (`?mode=ro`) SQLite FTS5 + deterministic vector index of 281 real
     GOV.UK Residential Property Tribunal Rent Repayment Order (RRO) decisions.
     """
     import sys
@@ -1117,6 +1118,74 @@ def search_uk_rro_precedents(
         max_pct=max_pct,
         limit=limit,
         export_format=export_format,
+        internal=internal,
+    )
+
+
+def calculate_uk_rro_award_and_schedule(
+    monthly_rent_gbp: float,
+    months_claimed: int = 12,
+    region: str = "London",
+    offence_type: str = "Unlicensed HMO (s.72)",
+    universal_credit_monthly_gbp: float = 0.0,
+    utilities_monthly_gbp: float = 0.0,
+    mitigation_factors: list[str] | None = None,
+    role: str = "landlord",
+    property_reference: str = "",
+    *,
+    export_format: str = "json",
+    internal: bool = False,
+) -> dict[str, Any]:
+    """
+    Deterministic Section 44 Housing and Planning Act 2016 & Renters' Rights Act 2026
+    (1-24 month cap) RRO Award & Mitigation Calculator + Scott Schedule Generator.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import calculate_rro_award_and_schedule as _calc_impl
+
+    return _calc_impl(
+        monthly_rent_gbp=monthly_rent_gbp,
+        months_claimed=months_claimed,
+        region=region,
+        offence_type=offence_type,
+        universal_credit_monthly_gbp=universal_credit_monthly_gbp,
+        utilities_monthly_gbp=utilities_monthly_gbp,
+        mitigation_factors=mitigation_factors,
+        role=role,
+        property_reference=property_reference,
+        export_format=export_format,
+        internal=internal,
+    )
+
+
+def record_uk_rro_buy_pack_intent(
+    region: str = "London",
+    offence_type: str = "Unlicensed HMO (s.72)",
+    role: str = "landlord",
+    *,
+    internal: bool = False,
+) -> dict[str, Any]:
+    """
+    Record high-intent £29 Regional Defence & Precedent Dossier Pack checkout click.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import record_rro_buy_pack_intent as _buy_impl
+
+    return _buy_impl(
+        region=region,
+        offence_type=offence_type,
+        role=role,
+        internal=internal,
     )
 
 
@@ -1125,6 +1194,8 @@ def audit_private_rro_claim_or_pdf(
     claim_text: str = "",
     region_hint: str = "",
     claimed_gbp_hint: float | None = None,
+    *,
+    internal: bool = False,
 ) -> dict[str, Any]:
     """
     Stateless per-request private RRO claim / PDF audit.
@@ -1144,6 +1215,7 @@ def audit_private_rro_claim_or_pdf(
         claim_text=claim_text,
         region_hint=region_hint,
         claimed_gbp_hint=claimed_gbp_hint,
+        internal=internal,
     )
 
 
@@ -1162,9 +1234,10 @@ def get_uk_rro_usage_stats() -> dict[str, Any]:
     return _stats_impl()
 
 
-def record_uk_rro_usage_event(event_type: str) -> dict[str, Any]:
+def record_uk_rro_usage_event(event_type: str, *, internal: bool = False) -> dict[str, Any]:
     """
-    Increment a privacy-safe aggregate RRO usage counter ("search", "pack_download", "private_audit").
+    Increment a privacy-safe aggregate RRO usage counter
+    ("search", "calculator_run", "pack_download", "private_audit", "buy_pack_click").
     """
     import sys
     from pathlib import Path
@@ -1174,4 +1247,34 @@ def record_uk_rro_usage_event(event_type: str) -> dict[str, Any]:
         sys.path.insert(0, rro_dir)
     from rro_engine import record_rro_usage_event as _rec_impl
 
-    return _rec_impl(event_type=event_type)
+    return _rec_impl(event_type=event_type, internal=internal)
+
+
+def get_uk_rro_seo_page(slug: str) -> dict[str, Any] | None:
+    """
+    Lookup a programmatic RRO SEO page by slug (region, council/borough, or offence type).
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from seo_router import get_seo_page as _seo_page_impl
+
+    return _seo_page_impl(slug)
+
+
+def render_uk_rro_seo_page_html(slug: str) -> str | None:
+    """
+    Render full HTML + Schema.org Dataset/FAQPage JSON-LD for a programmatic RRO SEO page.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from seo_router import render_seo_page_html as _seo_html_impl
+
+    return _seo_html_impl(slug)

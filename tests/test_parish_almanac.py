@@ -292,7 +292,7 @@ def test_parish_almanac_rro_usage_stats_zero_pii() -> None:
     assert stats_before["stores_uploaded_pdfs"] is False
     assert stats_before["ogl_reference_db_mode"] == "OGL-v3.0-read-only"
     assert stats_before["private_pdf_audit_mode"] == "stateless-ephemeral-finally-wiped"
-    assert stats_before["corpus_size"] == 80
+    assert stats_before["corpus_size"] == 281
 
     pa.search_uk_rro_precedents(q="Ealing", export_format="csv")
     stats_after = pa.get_uk_rro_usage_stats()
