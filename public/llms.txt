@@ -1,0 +1,13 @@
+# UK Parish Council, Village Hall, Charity & Payroll Statutory Almanac + MCP Schema Linter
+> Deterministic UK local-authority, charity, HMRC payroll & Apify/MCP developer toolkit powered by Open Government Licence v3.0 data.
+> Live URL: https://parish.technoplusit.co.uk
+
+## Live Endpoints
+- GET /api/almanac?year=2026&postcode=OX14+4AB&meeting=2026-11-16&domain=gov.uk&electors=1200&seats=11&elected=8&cilca=true&spend=4500&charity_income=35000&charity_assets=150000
+- GET /api/three-clear-days?meeting=2026-11-16
+- GET /api/s137-gpc?electors=1200&seats=11&elected=6&cilca=false&spend=8500&fy=2026/27
+- GET /api/charity-thresholds?income=35000&assets=150000&structure=unincorporated_or_cio&fye=2027-03-31
+- GET /api/hmrc-bik-cap?cash_salary=12000&bik=48000&periods=12
+- GET or POST /api/apify-mcp-lint (pass JSON schema body or ?schema=...)
+- GET /api/health
+- GET /.well-known/agent.json

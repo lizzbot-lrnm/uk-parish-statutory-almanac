@@ -1,0 +1,19 @@
+{
+  "name": "UK Parish, Charity & HMRC Statutory Almanac + Apify MCP Schema Linter",
+  "version": "1.1.0",
+  "url": "https://parish.technoplusit.co.uk",
+  "description": "Deterministic UK Parish Council, Village Hall, Charity Commission (30 Sept 2026 thresholds), HMRC Mandatory Payrolling of Benefits in Kind (50% overriding cap), and Apify-to-MCP input_schema.json linter.",
+  "llm_tokens_per_call": 0,
+  "personal_data_processed": false,
+  "licence": "Open Government Licence v3.0",
+  "endpoints": {
+    "almanac": "https://parish.technoplusit.co.uk/api/almanac?year=2026&postcode=OX14+4AB&meeting=2026-11-16&domain=gov.uk&electors=1200&seats=11&elected=8&cilca=true&charity_income=35000",
+    "three_clear_days": "https://parish.technoplusit.co.uk/api/three-clear-days?meeting=2026-11-16",
+    "s137_and_gpc": "https://parish.technoplusit.co.uk/api/s137-gpc?electors=1200&seats=11&elected=6&cilca=false&spend=8500&fy=2026/27",
+    "charity_2026_thresholds": "https://parish.technoplusit.co.uk/api/charity-thresholds?income=35000&assets=150000&structure=unincorporated_or_cio&fye=2027-03-31",
+    "hmrc_bik_50pct_cap": "https://parish.technoplusit.co.uk/api/hmrc-bik-cap?cash_salary=12000&bik=48000&periods=12",
+    "apify_mcp_schema_lint": "https://parish.technoplusit.co.uk/api/apify-mcp-lint",
+    "health": "https://parish.technoplusit.co.uk/api/health",
+    "llms_txt": "https://parish.technoplusit.co.uk/llms.txt"
+  }
+}
