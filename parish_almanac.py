@@ -497,22 +497,35 @@ S137_RATES_BY_FY: dict[str, float] = {
 
 
 def calculate_s137_and_gpc_eligibility(
-    electors_count: int,
+    electors_count: int = 1200,
     total_councillor_seats: int = 11,
     elected_councillors: int = 7,
-    clerk_cilca_qualified: bool = False,
+    clerk_cilca_qualified: bool | None = None,
     proposed_s137_spend_gbp: float = 0.0,
     financial_year: str = "2026/27",
+    *,
+    clerk_ciLCA: bool | None = None,
+    cilca: bool | None = None,
+    clerk_qualified: bool | None = None,
+    total_seats: int | None = None,
+    elected: int | None = None,
+    proposed_spend: float | None = None,
 ) -> dict[str, Any]:
     """
     Calculate Local Government Act 1972 s.137(4)(a) annual expenditure cap (£11.60/elector in 2026/27)
     AND evaluate General Power of Competence (GPC) eligibility under the Localism Act 2011 (ss. 1-8)
     and The Parish Councils (General Power of Competence) (Prescribed Conditions) Order 2012 (SI 2012/965).
+    Supports parameter aliases (`clerk_ciLCA`, `cilca`, `clerk_qualified`, ` clerk_cilca_qualified`).
     """
+    resolved_cilca = next(
+        (bool(v) for v in (clerk_cilca_qualified, clerk_ciLCA, cilca, clerk_qualified) if v is not None),
+        False,
+    )
+    clerk_cilca_qualified = resolved_cilca
     electors = max(0, int(electors_count))
-    seats = max(1, int(total_councillor_seats))
-    elected = max(0, min(seats, int(elected_councillors)))
-    spend = max(0.0, float(proposed_s137_spend_gbp))
+    seats = max(1, int(total_seats if total_seats is not None else total_councillor_seats))
+    elected = max(0, min(seats, int(elected if elected is not None else elected_councillors)))
+    spend = max(0.0, float(proposed_spend if proposed_spend is not None else proposed_s137_spend_gbp))
     fy = financial_year if financial_year in S137_RATES_BY_FY else "2026/27"
     rate_per_elector = S137_RATES_BY_FY[fy]
 
@@ -691,37 +704,75 @@ def check_charity_2026_thresholds(
 
 
 def calculate_hmrc_bik_payrolling_cap(
-    annual_cash_salary_gbp: float,
-    annual_bik_cash_equivalent_gbp: float,
+    annual_cash_salary_gbp: float = 18_000.0,
+    annual_bik_cash_equivalent_gbp: float = 36_000.0,
     pay_periods_per_year: int = 12,
     marginal_tax_rate: float | None = None,
     personal_allowance_gbp: float = 12_570.0,
+    registration_month: int = 1,
+    remaining_pay_periods: int | None = None,
+    monthly_cash_pay_schedule: list[float] | dict[int | str, float] | str | None = None,
+    bonus_month: int | None = None,
+    bonus_amount_gbp: float = 0.0,
 ) -> dict[str, Any]:
     """
     HMRC Mandatory Payrolling of Benefits in Kind (BiKs) — 50% Overriding Regulatory Limit & Carry-Forward Calculator.
     Models:
     - HMRC PAYE Specification (v24.0): Income Tax deducted in any pay period cannot exceed 50% of the employee's
       cash pay (excluding notional payrolled benefits).
-    - Month-by-month (or period-by-period) carry-forward of uncollected tax within the tax year.
+    - Mid-year benefit registration (`registration_month`, 1..12, or `remaining_pay_periods`): compresses an annual
+      or newly registered benefit across the remaining active pay periods while regular cash tax applies normally.
+    - Variable monthly cash pay (`monthly_cash_pay_schedule` or `bonus_month` + `bonus_amount_gbp`): models how
+      uncollected BiK tax carried forward from a low-cash / capped period is absorbed in subsequent higher-cash
+      periods vs spilling into year-end P800 recovery.
     - Real-time Class 1A Employer National Insurance (15% rate) per pay period vs annual total.
     """
     cash_annual = max(0.0, float(annual_cash_salary_gbp))
     bik_annual = max(0.0, float(annual_bik_cash_equivalent_gbp))
     periods = int(pay_periods_per_year) if int(pay_periods_per_year) in (1, 4, 12, 26, 52) else 12
 
-    period_cash_pay = round(cash_annual / periods, 2)
-    period_notional_bik = round(bik_annual / periods, 2)
-    overriding_50pct_cap_per_period = round(period_cash_pay * 0.50, 2)
+    if remaining_pay_periods is not None:
+        rem = max(1, min(periods, int(remaining_pay_periods)))
+        reg_period = periods - rem + 1
+    else:
+        reg_period = max(1, min(periods, int(registration_month or 1)))
+    active_bik_periods = max(1, periods - reg_period + 1)
+
+    base_period_cash_pay = round(cash_annual / periods, 2)
+    active_period_notional_bik = round(bik_annual / active_bik_periods, 2)
+    base_overriding_50pct_cap = round(base_period_cash_pay * 0.50, 2)
+
+    # Build per-period cash pay schedule (supports constant pay, CSV/list schedule, dict overrides, or bonus_month)
+    cash_schedule: list[float] = [base_period_cash_pay for _ in range(periods)]
+    if monthly_cash_pay_schedule is not None:
+        if isinstance(monthly_cash_pay_schedule, str):
+            parts = [p.strip() for p in monthly_cash_pay_schedule.split(",") if p.strip()]
+            for idx, val_str in enumerate(parts[:periods]):
+                cash_schedule[idx] = round(max(0.0, float(val_str)), 2)
+        elif isinstance(monthly_cash_pay_schedule, (list, tuple)):
+            for idx, val in enumerate(list(monthly_cash_pay_schedule)[:periods]):
+                cash_schedule[idx] = round(max(0.0, float(val)), 2)
+        elif isinstance(monthly_cash_pay_schedule, dict):
+            for k, v in monthly_cash_pay_schedule.items():
+                p_idx = int(k) - 1
+                if 0 <= p_idx < periods:
+                    cash_schedule[p_idx] = round(max(0.0, float(v)), 2)
+
+    if bonus_month is not None and 1 <= int(bonus_month) <= periods and float(bonus_amount_gbp) != 0.0:
+        b_idx = int(bonus_month) - 1
+        cash_schedule[b_idx] = round(max(0.0, cash_schedule[b_idx] + float(bonus_amount_gbp)), 2)
+
+    effective_annual_cash = round(sum(cash_schedule), 2)
 
     if marginal_tax_rate is not None:
         rate = max(0.0, min(0.60, float(marginal_tax_rate)))
         period_allowance = round(max(0.0, float(personal_allowance_gbp)) / periods, 2)
-        taxable_per_period = max(0.0, (period_cash_pay + period_notional_bik) - period_allowance)
-        cash_only_taxable_per_period = max(0.0, period_cash_pay - period_allowance)
-        raw_tax_per_period = round(taxable_per_period * rate, 2)
-        cash_only_tax_per_period = round(cash_only_taxable_per_period * rate, 2)
+        cash_only_tax_per_period = round(max(0.0, base_period_cash_pay - period_allowance) * rate, 2)
+        annual_bik_tax = round(bik_annual * rate, 2)
+        bik_tax_per_active_period = round(annual_bik_tax / active_bik_periods, 2)
+        raw_tax_per_period = round(cash_only_tax_per_period + bik_tax_per_active_period, 2)
+        marginal_rate_for_delta = rate
     else:
-        # Standard England/Wales/NI 2026/27 1257L bands (with £100k PA taper)
         def _uk_annual_income_tax(gross: float) -> float:
             pa = float(personal_allowance_gbp)
             if gross > 100_000.0:
@@ -737,63 +788,96 @@ def calculate_hmrc_bik_payrolling_cap(
 
         annual_total_tax = _uk_annual_income_tax(cash_annual + bik_annual)
         annual_cash_only_tax = _uk_annual_income_tax(cash_annual)
-        raw_tax_per_period = round(annual_total_tax / periods, 2)
+        annual_bik_tax = max(0.0, annual_total_tax - annual_cash_only_tax)
         cash_only_tax_per_period = round(annual_cash_only_tax / periods, 2)
+        bik_tax_per_active_period = round(annual_bik_tax / active_bik_periods, 2)
+        if reg_period == 1:
+            raw_tax_per_period = round(annual_total_tax / periods, 2)
+            bik_tax_per_active_period = round(raw_tax_per_period - cash_only_tax_per_period, 2)
+        else:
+            raw_tax_per_period = round(cash_only_tax_per_period + bik_tax_per_active_period, 2)
+        marginal_rate_for_delta = 0.45 if (cash_annual + bik_annual) > 125_140.0 else (0.40 if (cash_annual + bik_annual) > 50_270.0 else 0.20)
 
     schedule: list[dict[str, Any]] = []
     carried_forward = 0.0
     total_tax_deducted = 0.0
+    total_carried_forward_absorbed = 0.0
     any_cap_triggered = False
 
     for p in range(1, periods + 1):
-        total_due_this_period = round(raw_tax_per_period + carried_forward, 2)
-        if total_due_this_period > overriding_50pct_cap_per_period:
+        cash_p = cash_schedule[p - 1]
+        cap_p = round(cash_p * 0.50, 2)
+        bik_active = p >= reg_period
+        notional_bik_p = active_period_notional_bik if bik_active else 0.0
+
+        # Compute period tax directly on (cash_p + notional_bik_p) so low-cash / high-BiK and mid-year compression are exact
+        if reg_period == 1 and abs(cash_p - base_period_cash_pay) < 0.01:
+            period_new_tax = raw_tax_per_period
+        elif marginal_tax_rate is not None:
+            period_allowance = round(max(0.0, float(personal_allowance_gbp)) / periods, 2)
+            period_new_tax = round(max(0.0, (cash_p + notional_bik_p) - period_allowance) * marginal_rate_for_delta, 2)
+        else:
+            period_new_tax = round(_uk_annual_income_tax((cash_p + notional_bik_p) * periods) / periods, 2)
+
+        brought_forward = carried_forward
+        total_due_this_period = round(period_new_tax + brought_forward, 2)
+        if total_due_this_period > cap_p:
             any_cap_triggered = True
-            deducted = overriding_50pct_cap_per_period
+            deducted = cap_p
             uncollected_next = round(total_due_this_period - deducted, 2)
+            absorbed_this_period = round(max(0.0, deducted - period_new_tax), 2)
         else:
             deducted = total_due_this_period
             uncollected_next = 0.0
+            absorbed_this_period = brought_forward
 
-        net_cash_take_home_before_ni = round(period_cash_pay - deducted, 2)
+        total_carried_forward_absorbed = round(total_carried_forward_absorbed + absorbed_this_period, 2)
+        net_cash_take_home_before_ni = round(cash_p - deducted, 2)
         total_tax_deducted = round(total_tax_deducted + deducted, 2)
         schedule.append(
             {
                 "period": p,
-                "cash_pay_gbp": period_cash_pay,
-                "notional_payrolled_bik_gbp": period_notional_bik,
-                "brought_forward_uncollected_tax_gbp": carried_forward,
+                "cash_pay_gbp": cash_p,
+                "notional_payrolled_bik_gbp": notional_bik_p,
+                "brought_forward_uncollected_tax_gbp": brought_forward,
+                "current_period_tax_gbp": period_new_tax,
                 "total_tax_liability_in_period_gbp": total_due_this_period,
-                "hmrc_50pct_overriding_cap_gbp": overriding_50pct_cap_per_period,
+                "hmrc_50pct_overriding_cap_gbp": cap_p,
                 "tax_deducted_from_pay_gbp": deducted,
+                "carried_forward_absorbed_in_period_gbp": absorbed_this_period,
                 "uncollected_tax_carried_forward_gbp": uncollected_next,
-                "cap_triggered": total_due_this_period > overriding_50pct_cap_per_period,
+                "cap_triggered": total_due_this_period > cap_p,
                 "cash_pay_after_income_tax_gbp": net_cash_take_home_before_ni,
             }
         )
         carried_forward = uncollected_next
 
     annual_class_1a_nic = round(bik_annual * 0.15, 2)
-    period_class_1a_nic = round(annual_class_1a_nic / periods, 2)
+    period_class_1a_nic = round(annual_class_1a_nic / active_bik_periods, 2)
 
     return {
         "status": "ok",
         "statute": "HMRC PAYE Specification for Tax Table Routines (v24.0) & Mandatory Payrolling of Benefits in Kind (April 2027)",
         "inputs": {
             "annual_cash_salary_gbp": round(cash_annual, 2),
+            "effective_total_cash_pay_in_schedule_gbp": effective_annual_cash,
             "annual_bik_cash_equivalent_gbp": round(bik_annual, 2),
             "pay_periods_per_year": periods,
+            "bik_registration_period": reg_period,
+            "active_bik_pay_periods": active_bik_periods,
+            "variable_cash_pay_mode": any(abs(c - base_period_cash_pay) >= 0.01 for c in cash_schedule),
         },
         "per_period_summary": {
-            "period_cash_pay_gbp": period_cash_pay,
-            "period_notional_bik_gbp": period_notional_bik,
-            "hmrc_50pct_overriding_limit_gbp": overriding_50pct_cap_per_period,
+            "period_cash_pay_gbp": base_period_cash_pay,
+            "period_notional_bik_gbp": active_period_notional_bik,
+            "hmrc_50pct_overriding_limit_gbp": base_overriding_50pct_cap,
             "cash_only_tax_per_period_gbp": cash_only_tax_per_period,
             "uncapped_tax_with_bik_per_period_gbp": raw_tax_per_period,
-            "incremental_bik_tax_per_period_gbp": round(raw_tax_per_period - cash_only_tax_per_period, 2),
+            "incremental_bik_tax_per_period_gbp": bik_tax_per_active_period,
         },
         "overriding_limit_triggered": any_cap_triggered,
         "total_tax_deducted_via_payroll_gbp": total_tax_deducted,
+        "total_carried_forward_tax_absorbed_in_subsequent_periods_gbp": total_carried_forward_absorbed,
         "year_end_uncollected_tax_for_hmrc_p800_recovery_gbp": carried_forward,
         "employer_class_1a_nic_15pct": {
             "rate": 0.15,
@@ -809,7 +893,6 @@ def calculate_hmrc_bik_payrolling_cap(
         "period_schedule": schedule,
         "source_url": "https://www.gov.uk/guidance/payrolling-tax-employees-benefits-and-expenses-through-your-payroll",
     }
-
 
 def lint_apify_mcp_input_schema(
     input_schema_or_json: str | dict[str, Any],
@@ -962,3 +1045,38 @@ def lint_apify_mcp_input_schema(
         "fixed_input_schema": fixed,
         "reference_url": "https://docs.apify.com/platform/actors/development/actor-definition/input-schema/specification/v1",
     }
+
+
+
+def extract_uk_scanned_pdf_clauses(
+    pdf_path: str | None = None,
+    pdf_bytes: bytes | None = None,
+    pdf_base64: str | None = None,
+    pdf_url: str | None = None,
+    raw_text: str | None = None,
+    document_type: str = "auto",
+    semantic_query: str | None = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """
+    Zero-Token UK Scanned PDF & Deed Clause Extractor (pdftotext + pypdfium2 + RapidOCR +
+    local FastEmbed BAAI/bge-small-en-v1.5 + ephemeral in-memory sqlite-vec).
+    """
+    import sys
+    from pathlib import Path
+
+    mcp_dir = str(Path(__file__).resolve().parents[1] / "uk-us-compliance-mcp-actor")
+    if mcp_dir not in sys.path:
+        sys.path.insert(0, mcp_dir)
+    from pdf_clause_extractor import extract_uk_scanned_pdf_clauses as _impl
+
+    return _impl(
+        pdf_path=pdf_path,
+        pdf_bytes=pdf_bytes,
+        pdf_base64=pdf_base64,
+        pdf_url=pdf_url,
+        raw_text=raw_text,
+        document_type=document_type,
+        semantic_query=semantic_query,
+        top_k=top_k,
+    )

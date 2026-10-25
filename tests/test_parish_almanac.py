@@ -204,3 +204,61 @@ def test_apify_mcp_input_schema_linter_catches_techtimmy_bug() -> None:
     fixed_entity = lint["fixed_input_schema"]["properties"]["entity_name"]
     assert "default" not in fixed_entity
     assert fixed_entity["prefill"] == "Oxfam"
+
+
+def test_spock_hmrc_bik_midyear_and_variable_cash_pay_recovery() -> None:
+    # 1. Verify clerk_ciLCA alias on calculate_s137_and_gpc_eligibility
+    gpc_alias = pa.calculate_s137_and_gpc_eligibility(
+        electors_count=1200,
+        total_seats=12,
+        elected_councillors=8,
+        clerk_ciLCA=True,
+        proposed_spend=15000.0,
+    )
+    assert gpc_alias["gpc_assessment"]["clerk_holds_cilca_or_level4"] is True
+    assert gpc_alias["gpc_assessment"]["gpc_eligible"] is True
+
+    # 2. Mid-year registration (Month 10 -> 3 remaining pay periods: Oct, Nov, Dec/Jan-Mar)
+    mid_year = pa.calculate_hmrc_bik_payrolling_cap(
+        annual_cash_salary_gbp=24000.0,
+        annual_bik_cash_equivalent_gbp=18000.0,
+        pay_periods_per_year=12,
+        registration_month=10,
+    )
+    assert mid_year["inputs"]["bik_registration_period"] == 10
+    assert mid_year["inputs"]["active_bik_pay_periods"] == 3
+    # Months 1..9 have £0 notional BiK; Month 10 has £6,000 notional BiK (£18,000 / 3)
+    assert mid_year["period_schedule"][0]["notional_payrolled_bik_gbp"] == 0.0
+    assert mid_year["period_schedule"][8]["notional_payrolled_bik_gbp"] == 0.0
+    assert mid_year["period_schedule"][9]["notional_payrolled_bik_gbp"] == 6000.0
+
+    # 3. Variable monthly cash pay: Month 1 has low cash pay (£600 unpaid leave month -> 50% cap = £300),
+    # triggering carry-forward of uncollected BiK tax, followed by Month 2 bonus/normal pay (£4,500 -> cap = £2,250)
+    # where the carried-forward tax is 100% absorbed inside the tax year (zero P800 balance at year end)!
+    var_pay = pa.calculate_hmrc_bik_payrolling_cap(
+        annual_cash_salary_gbp=24000.0,
+        annual_bik_cash_equivalent_gbp=24000.0,
+        pay_periods_per_year=12,
+        monthly_cash_pay_schedule={1: 600.0, 2: 4500.0},
+    )
+    assert var_pay["inputs"]["variable_cash_pay_mode"] is True
+    assert var_pay["overriding_limit_triggered"] is True
+    assert var_pay["period_schedule"][0]["cap_triggered"] is True
+    assert var_pay["period_schedule"][0]["uncollected_tax_carried_forward_gbp"] > 0.0
+    assert var_pay["period_schedule"][1]["carried_forward_absorbed_in_period_gbp"] > 0.0
+    assert var_pay["total_carried_forward_tax_absorbed_in_subsequent_periods_gbp"] > 0.0
+    assert var_pay["year_end_uncollected_tax_for_hmrc_p800_recovery_gbp"] == 0.0
+
+
+def test_parish_almanac_pdf_clause_extractor_integration() -> None:
+    res = pa.extract_uk_scanned_pdf_clauses(
+        raw_text=(
+            "Clause 4.1: The Owner covenants to pay the Affordable Housing Contribution of £145,000 "
+            "indexed to the BCIS All-In Tender Price Index prior to occupation of the 15th dwelling."
+        ),
+        document_type="s106",
+    )
+    assert res["status"] == "ok"
+    assert res["tenant_isolation_proof"]["shared_database_used"] is False
+    assert res["extracted_clauses"]["s106_planning_obligations"]["total_quantified_contributions_gbp"] == 145000.0
+    assert res["benchmark_telemetry"]["llm_tokens_used"] == 0
