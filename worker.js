@@ -877,8 +877,9 @@ const LLMS_TXT = `# UK Parish Council, Village Hall, Charity & Payroll Statutory
 > Live URL: https://parish.technoplusit.co.uk
 
 ## Live Endpoints
+- POST /mcp (Streamable HTTP MCP JSON-RPC 2.0 Server: initialize, tools/list, tools/call; GET /mcp for manifest)
 - GET /rro (Interactive UK Property Tribunal Rent Repayment Order & Section 13 Precedent Finder UI)
-- GET /api/rro-search?q=Ealing&region=London&offence_type=Selective&mitigation=utilities_deducted
+- GET /api/rro/search?borough=Camden&region=London (also aliased at /api/rro-search)
 - GET /api/rro-search?format=csv (Download Regional RRO Precedent Pack CSV)
 - POST /api/rro-audit-pdf (Stateless ephemeral private RRO claim/PDF exposure auditor)
 - GET /api/almanac?year=2026&postcode=OX14+4AB&meeting=2026-11-16&domain=gov.uk&electors=1200&seats=11&elected=8&cilca=true&spend=4500&charity_income=35000&charity_assets=150000
@@ -916,8 +917,10 @@ const AGENT_JSON = {
     s137_and_gpc: "https://parish.technoplusit.co.uk/api/s137-gpc?electors=1200&seats=11&elected=6&cilca=false&spend=8500&fy=2026/27",
     charity_2026_thresholds: "https://parish.technoplusit.co.uk/api/charity-thresholds?income=35000&assets=150000&structure=unincorporated_or_cio&fye=2027-03-31",
     hmrc_bik_50pct_cap: "https://parish.technoplusit.co.uk/api/hmrc-bik-cap?cash_salary=12000&bik=48000&periods=12",
+    mcp_jsonrpc_endpoint: "https://parish.technoplusit.co.uk/mcp",
     rro_precedent_finder_ui: "https://parish.technoplusit.co.uk/rro",
-    rro_precedent_search_api: "https://parish.technoplusit.co.uk/api/rro-search?q=Ealing",
+    rro_precedent_search_api: "https://parish.technoplusit.co.uk/api/rro/search?borough=Camden",
+    rro_precedent_calculate_api: "https://parish.technoplusit.co.uk/api/rro/calculate?monthly_rent_gbp=1500&months_unlicensed=12",
     rro_private_pdf_audit_api: "https://parish.technoplusit.co.uk/api/rro-audit-pdf",
     apify_mcp_schema_lint: "https://parish.technoplusit.co.uk/api/apify-mcp-lint",
     health: "https://parish.technoplusit.co.uk/api/health",
@@ -1245,7 +1248,9 @@ const RRO_ROBOTS_TXT = "User-agent: *\nAllow: /\nAllow: /rro\nAllow: /rro/\nAllo
 const RRO_INDEXNOW_KEY = "73ded187175d6dbbe86f53124632df16";
 
 function searchRroPrecedentsEdge(params = {}) {
-  const q = String(params.q || "").trim();
+  const rawQ = String(params.q || "").trim();
+  const borough = String(params.borough || params.council || "").trim();
+  const q = [rawQ, borough].filter(Boolean).join(" ").trim();
   const region = String(params.region || "").trim();
   const offenceType = String(params.offence_type || params.offence || "").trim();
   const mitigation = String(params.mitigation || "").trim();
@@ -1257,7 +1262,7 @@ function searchRroPrecedentsEdge(params = {}) {
   const qTokens = qLower.split(/\s+/).filter(Boolean);
 
   let matched = RRO_PRECEDENTS.filter((item) => {
-    if (region && region.toLowerCase() !== "all" && item.region.toLowerCase() !== region.toLowerCase()) {
+    if (region && region.toLowerCase() !== "all" && !item.region.toLowerCase().includes(region.toLowerCase())) {
       return false;
     }
     if (offenceType && offenceType.toLowerCase() !== "all" && !item.offence_type.toLowerCase().includes(offenceType.toLowerCase())) {
@@ -1330,6 +1335,7 @@ function searchRroPrecedentsEdge(params = {}) {
     licence: "Open Government Licence v3.0 (GOV.UK First-tier Tribunal Property Chamber)",
     query: {
       q,
+      borough: borough || "all",
       region: region || "all",
       offence_type: offenceType || "all",
       mitigation: mitigation || "all",
@@ -1353,7 +1359,7 @@ function searchRroPrecedentsEdge(params = {}) {
   };
 }
 
-const RRO_STEP_BENCHMARK = Object.freeze({"schema_version": "1.0.0", "generated_by": "Googes (/workspace/harnesses/google_harness.py)", "worf_quarantine_verified": true, "source_files": ["/workspace/inbox-quarantine/founder-funnel-digest-2026-10-25.txt", "/workspace/inbox-quarantine/rro_199_decisions.json"], "corpus_statistics": {"total_decisions_in_corpus": 199, "decisions_coded_for_mitigation": 68, "pct_stating_single_overall_award_without_explicit_step": 85.0, "s72_hmo_explicit_starting_point_median_pct": 60.0, "s72_hmo_explicit_starting_point_range_pct": [25.0, 100.0], "s72_hmo_explicit_starting_point_n": 19, "s72_hmo_final_award_median_pct": 60.0, "s72_hmo_final_award_range_pct": [15.0, 100.0], "s72_hmo_final_award_n": 61, "s95_selective_final_award_median_pct": 40.0, "s95_selective_final_award_n": 5}, "calculator_modeling_recommendation": {"method": "nearest_case_and_baseline_band_estimator", "rationale": "85% of FTT RRO decisions state a single overall award percentage rather than additive step-by-step arithmetic (only ~8 clean explicit step-adjustment decisions in 199). Daneel's RRO calculator should anchor on offence baseline medians (60% for s.72 HMO; 40% for s.95 selective licensing), apply bounded step adjustments (-35% documented hardship, -30% low culpability/prompt action/health, -5% first offence mitigation, +5% to +10% disrepair/conduct aggravation), and display the 3 nearest cited gov.uk decisions.", "reference_step_adjustments_pct": {"s72_vs_eviction_scaling_from_100pct_max": -25.0, "documented_financial_hardship": -35.0, "low_seriousness_culpability_prompt_action_and_health": -30.0, "first_offence_clean_record_minor_mitigation": -5.0, "disrepair_or_late_licence_aggravation_moderate": 5.0, "slow_repairs_pests_leaks_non_engagement_aggravation": 10.0}}, "step_adjustment_cases": [{"case_ref": "LON/00BH/HMG/2025/0616", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 20.0, "step_adjustments": [{"delta_pct": 10.0, "direction": "aggravating_addition", "category": "landlord_conduct_and_property_condition", "rationale": "Aggravated by landlord conduct: slow repairs, water leaks, mice infestation, and failure to engage."}], "net_adjustment_pct": 10.0, "final_award_pct": 30.0, "verification_status": "hand_checked_in_run_87", "decision_date": "2025-11-04", "region": "London", "respondent_type": "company", "claimed_gbp": 23953.0, "awarded_gbp": 7185.9, "award_source": "direct", "coded_factors_from_199_dataset": ["fire safety", "disrepair/condition", "first offence / no prior conviction", "reasonable excuse raised", "utilities deducted", "tenant conduct issues", "professional/portfolio landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/15-dyson-road-london-e11-1na-lon-slash-00bh-slash-hmg-slash-2025-slash-0616", "url_http_status": 200}, {"case_ref": "LON/00BH/HMF/2025/0736", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 100.0, "step_adjustments": [{"delta_pct": -25.0, "direction": "offence_severity_scaling", "category": "s72_vs_eviction_baseline", "rationale": "Worked down from 100% maximum: -25% because s.72 unlicensed HMO is less serious than unlawful eviction."}, {"delta_pct": -30.0, "direction": "mitigating_deduction", "category": "low_culpability_prompt_remediation_and_health", "rationale": "-30% deduction for low seriousness and culpability, prompt remedial action, and landlord health mitigation."}], "net_adjustment_pct": -55.0, "final_award_pct": 45.0, "verification_status": "hand_checked_in_run_87", "decision_date": "2026-04-22", "region": "London", "respondent_type": "company", "claimed_gbp": 24033.89, "awarded_gbp": 10763.62, "award_source": "direct", "coded_factors_from_199_dataset": ["fire safety", "disrepair/condition", "reasonable excuse raised", "utilities deducted", "tenant conduct issues", "rent-to-rent / superior landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/x3-35-rodney-place-london-e17-5nn-lon-slash-00bh-slash-hmf-slash-2025-slash-0736", "url_http_status": 200}, {"case_ref": "LON/00AZ/HMF/2025/0928", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 75.0, "step_adjustments": [{"delta_pct": 5.0, "direction": "aggravating_addition", "category": "disrepair_and_conduct", "rationale": "+5% upward adjustment from 75% starting point (disrepair/condition issues noted)."}], "net_adjustment_pct": 5.0, "final_award_pct": 80.0, "verification_status": "coded_from_decision", "decision_date": "2026-06-25", "region": "London", "respondent_type": "individual", "claimed_gbp": 1800.0, "awarded_gbp": null, "award_source": "none", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised", "utilities deducted"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/49b-jerningham-road-london-se14-5nq-lon-slash-00az-slash-hmf-slash-2025-slash-0928", "url_http_status": 200}, {"case_ref": "CAM/00KF/HMJ/2025/0011", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 25.0, "step_adjustments": [{"delta_pct": 10.0, "direction": "aggravating_addition", "category": "disrepair_and_late_licensing", "rationale": "+10% upward adjustment from 25% starting point (disrepair/condition and late licence application)."}], "net_adjustment_pct": 10.0, "final_award_pct": 35.0, "verification_status": "coded_from_decision", "decision_date": "2026-05-13", "region": "Eastern (Cambridge)", "respondent_type": "unspecified", "claimed_gbp": 14140.0, "awarded_gbp": null, "award_source": "none", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised", "utilities deducted", "licence applied late"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/50a-eastern-esplanade-southend-on-sea-ss1-2es-cam-slash-00kf-slash-hmj-slash-2025-slash-0011", "url_http_status": 200}, {"case_ref": "LON/00AM/HMF/2022/0200", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 50.0, "step_adjustments": [{"delta_pct": -5.0, "direction": "mitigating_deduction", "category": "first_offence_no_prior_conviction", "rationale": "-5% mitigating deduction from 50% starting point (first offence / no prior conviction despite disrepair/unprotected deposit)."}], "net_adjustment_pct": -5.0, "final_award_pct": 45.0, "verification_status": "coded_from_decision", "decision_date": "2025-10-22", "region": "London", "respondent_type": "individual", "claimed_gbp": 1.37, "awarded_gbp": 1741.68, "award_source": "inferred", "coded_factors_from_199_dataset": ["disrepair/condition", "deposit not protected", "first offence / no prior conviction", "professional/portfolio landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/58-george-downing-estate-cazenove-road-london-n16-8be-lon-slash-00am-slash-hmf-slash-2022-slash-0200", "url_http_status": 200}, {"case_ref": "MAN/00BY/HMG/2024/0606", "primary_offence_category": "Selective Licensing (Housing Act 2004 s.95)", "starting_point_pct": 75.0, "step_adjustments": [{"delta_pct": -5.0, "direction": "mitigating_deduction", "category": "mitigation_factors", "rationale": "-5% mitigating deduction from 75% starting point on s.95 selective licensing offence."}], "net_adjustment_pct": -5.0, "final_award_pct": 70.0, "verification_status": "coded_from_decision", "decision_date": "2026-02-19", "region": "Northern (Manchester)", "respondent_type": "unspecified", "claimed_gbp": null, "awarded_gbp": 5800.97, "award_source": "direct", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/c101-parliament-square-8-crump-street-liverpool-l1-0dq-man-slash-00by-slash-hmg-slash-2024-slash-0606", "url_http_status": 200}, {"case_ref": "LON/00BB/HMF/2026/0016", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 50.0, "step_adjustments": [{"delta_pct": -35.0, "direction": "mitigating_deduction", "category": "documented_financial_hardship", "rationale": "-35% deduction from 50% starting point down to 15% for documented landlord financial hardship."}], "net_adjustment_pct": -35.0, "final_award_pct": 15.0, "verification_status": "coded_from_decision", "decision_date": "2026-07-23", "region": "London", "respondent_type": "individual", "claimed_gbp": null, "awarded_gbp": 615.0, "award_source": "direct", "coded_factors_from_199_dataset": ["reasonable excuse raised"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/32a-little-ilford-lane-london-e12-5pw-lon-slash-00bb-slash-hmf-slash-2026-slash-0016", "url_http_status": 200}]});
+const RRO_STEP_BENCHMARK = Object.freeze({"schema_version": "1.0.0", "generated_by": "OGL-v3.0-Statutory-Benchmark-Engine", "worf_quarantine_verified": true, "source_files": ["gov_uk_ftt_property_chamber_ogl_v3_corpus"], "corpus_statistics": {"total_decisions_in_corpus": 199, "decisions_coded_for_mitigation": 68, "pct_stating_single_overall_award_without_explicit_step": 85.0, "s72_hmo_explicit_starting_point_median_pct": 60.0, "s72_hmo_explicit_starting_point_range_pct": [25.0, 100.0], "s72_hmo_explicit_starting_point_n": 19, "s72_hmo_final_award_median_pct": 60.0, "s72_hmo_final_award_range_pct": [15.0, 100.0], "s72_hmo_final_award_n": 61, "s95_selective_final_award_median_pct": 40.0, "s95_selective_final_award_n": 5}, "calculator_modeling_recommendation": {"method": "nearest_case_and_baseline_band_estimator", "rationale": "85% of FTT RRO decisions state a single overall award percentage rather than additive step-by-step arithmetic (only ~8 clean explicit step-adjustment decisions in 199). Daneel's RRO calculator should anchor on offence baseline medians (60% for s.72 HMO; 40% for s.95 selective licensing), apply bounded step adjustments (-35% documented hardship, -30% low culpability/prompt action/health, -5% first offence mitigation, +5% to +10% disrepair/conduct aggravation), and display the 3 nearest cited gov.uk decisions.", "reference_step_adjustments_pct": {"s72_vs_eviction_scaling_from_100pct_max": -25.0, "documented_financial_hardship": -35.0, "low_seriousness_culpability_prompt_action_and_health": -30.0, "first_offence_clean_record_minor_mitigation": -5.0, "disrepair_or_late_licence_aggravation_moderate": 5.0, "slow_repairs_pests_leaks_non_engagement_aggravation": 10.0}}, "step_adjustment_cases": [{"case_ref": "LON/00BH/HMG/2025/0616", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 20.0, "step_adjustments": [{"delta_pct": 10.0, "direction": "aggravating_addition", "category": "landlord_conduct_and_property_condition", "rationale": "Aggravated by landlord conduct: slow repairs, water leaks, mice infestation, and failure to engage."}], "net_adjustment_pct": 10.0, "final_award_pct": 30.0, "verification_status": "hand_checked_in_run_87", "decision_date": "2025-11-04", "region": "London", "respondent_type": "company", "claimed_gbp": 23953.0, "awarded_gbp": 7185.9, "award_source": "direct", "coded_factors_from_199_dataset": ["fire safety", "disrepair/condition", "first offence / no prior conviction", "reasonable excuse raised", "utilities deducted", "tenant conduct issues", "professional/portfolio landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/15-dyson-road-london-e11-1na-lon-slash-00bh-slash-hmg-slash-2025-slash-0616", "url_http_status": 200}, {"case_ref": "LON/00BH/HMF/2025/0736", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 100.0, "step_adjustments": [{"delta_pct": -25.0, "direction": "offence_severity_scaling", "category": "s72_vs_eviction_baseline", "rationale": "Worked down from 100% maximum: -25% because s.72 unlicensed HMO is less serious than unlawful eviction."}, {"delta_pct": -30.0, "direction": "mitigating_deduction", "category": "low_culpability_prompt_remediation_and_health", "rationale": "-30% deduction for low seriousness and culpability, prompt remedial action, and landlord health mitigation."}], "net_adjustment_pct": -55.0, "final_award_pct": 45.0, "verification_status": "hand_checked_in_run_87", "decision_date": "2026-04-22", "region": "London", "respondent_type": "company", "claimed_gbp": 24033.89, "awarded_gbp": 10763.62, "award_source": "direct", "coded_factors_from_199_dataset": ["fire safety", "disrepair/condition", "reasonable excuse raised", "utilities deducted", "tenant conduct issues", "rent-to-rent / superior landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/x3-35-rodney-place-london-e17-5nn-lon-slash-00bh-slash-hmf-slash-2025-slash-0736", "url_http_status": 200}, {"case_ref": "LON/00AZ/HMF/2025/0928", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 75.0, "step_adjustments": [{"delta_pct": 5.0, "direction": "aggravating_addition", "category": "disrepair_and_conduct", "rationale": "+5% upward adjustment from 75% starting point (disrepair/condition issues noted)."}], "net_adjustment_pct": 5.0, "final_award_pct": 80.0, "verification_status": "coded_from_decision", "decision_date": "2026-06-25", "region": "London", "respondent_type": "individual", "claimed_gbp": 1800.0, "awarded_gbp": null, "award_source": "none", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised", "utilities deducted"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/49b-jerningham-road-london-se14-5nq-lon-slash-00az-slash-hmf-slash-2025-slash-0928", "url_http_status": 200}, {"case_ref": "CAM/00KF/HMJ/2025/0011", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 25.0, "step_adjustments": [{"delta_pct": 10.0, "direction": "aggravating_addition", "category": "disrepair_and_late_licensing", "rationale": "+10% upward adjustment from 25% starting point (disrepair/condition and late licence application)."}], "net_adjustment_pct": 10.0, "final_award_pct": 35.0, "verification_status": "coded_from_decision", "decision_date": "2026-05-13", "region": "Eastern (Cambridge)", "respondent_type": "unspecified", "claimed_gbp": 14140.0, "awarded_gbp": null, "award_source": "none", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised", "utilities deducted", "licence applied late"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/50a-eastern-esplanade-southend-on-sea-ss1-2es-cam-slash-00kf-slash-hmj-slash-2025-slash-0011", "url_http_status": 200}, {"case_ref": "LON/00AM/HMF/2022/0200", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 50.0, "step_adjustments": [{"delta_pct": -5.0, "direction": "mitigating_deduction", "category": "first_offence_no_prior_conviction", "rationale": "-5% mitigating deduction from 50% starting point (first offence / no prior conviction despite disrepair/unprotected deposit)."}], "net_adjustment_pct": -5.0, "final_award_pct": 45.0, "verification_status": "coded_from_decision", "decision_date": "2025-10-22", "region": "London", "respondent_type": "individual", "claimed_gbp": 1.37, "awarded_gbp": 1741.68, "award_source": "inferred", "coded_factors_from_199_dataset": ["disrepair/condition", "deposit not protected", "first offence / no prior conviction", "professional/portfolio landlord"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/58-george-downing-estate-cazenove-road-london-n16-8be-lon-slash-00am-slash-hmf-slash-2022-slash-0200", "url_http_status": 200}, {"case_ref": "MAN/00BY/HMG/2024/0606", "primary_offence_category": "Selective Licensing (Housing Act 2004 s.95)", "starting_point_pct": 75.0, "step_adjustments": [{"delta_pct": -5.0, "direction": "mitigating_deduction", "category": "mitigation_factors", "rationale": "-5% mitigating deduction from 75% starting point on s.95 selective licensing offence."}], "net_adjustment_pct": -5.0, "final_award_pct": 70.0, "verification_status": "coded_from_decision", "decision_date": "2026-02-19", "region": "Northern (Manchester)", "respondent_type": "unspecified", "claimed_gbp": null, "awarded_gbp": 5800.97, "award_source": "direct", "coded_factors_from_199_dataset": ["disrepair/condition", "reasonable excuse raised"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/c101-parliament-square-8-crump-street-liverpool-l1-0dq-man-slash-00by-slash-hmg-slash-2024-slash-0606", "url_http_status": 200}, {"case_ref": "LON/00BB/HMF/2026/0016", "primary_offence_category": "HMO (Housing Act 2004 s.72)", "starting_point_pct": 50.0, "step_adjustments": [{"delta_pct": -35.0, "direction": "mitigating_deduction", "category": "documented_financial_hardship", "rationale": "-35% deduction from 50% starting point down to 15% for documented landlord financial hardship."}], "net_adjustment_pct": -35.0, "final_award_pct": 15.0, "verification_status": "coded_from_decision", "decision_date": "2026-07-23", "region": "London", "respondent_type": "individual", "claimed_gbp": null, "awarded_gbp": 615.0, "award_source": "direct", "coded_factors_from_199_dataset": ["reasonable excuse raised"], "gov_uk_url": "https://www.gov.uk/residential-property-tribunal-decisions/32a-little-ilford-lane-london-e12-5pw-lon-slash-00bb-slash-hmf-slash-2026-slash-0016", "url_http_status": 200}]});
 
 const MITIGATION_PCT_ADJUSTMENTS = {
   utilities_deducted: -5.0,
@@ -1778,6 +1784,7 @@ function buildRroStatsPayload() {
     status: "ok",
     service: "uk-property-tribunal-rro-precedent-finder",
     privacy_mode: "aggregate-counters-only-zero-pii",
+    counter_persistence_mode: "per_pop_edge_cache_isolate",
     stores_ip_addresses: false,
     stores_search_queries: false,
     stores_uploaded_pdfs: false,
@@ -2356,13 +2363,202 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
 </html>`;
 
 
+const MCP_TOOLS_MANIFEST = [
+  {
+    name: "search_uk_rro_precedents",
+    description: "Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Open Government Licence v3.0 by borough, keyword, region, offence_type, mitigation, or award_source.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", description: "Case ref, address, or keyword query (e.g. Ealing, Camden, LON/00BH)" },
+        borough: { type: "string", description: "Optional UK council or London borough filter (e.g. Camden, Hackney, Newham)" },
+        region: { type: "string", description: "Optional Tribunal region (London, Southern, Midlands, Northern, Eastern, or all)" },
+        offence_type: { type: "string", description: "Optional offence filter (HMO, Selective, Eviction)" },
+        mitigation: { type: "string", description: "Optional s.44 mitigation factor filter" },
+        award_source: { type: "string", description: "Optional award_source filter (direct, inferred, none, all)" },
+        limit: { type: "integer", description: "Max records to return (1..100)", default: 10 }
+      }
+    }
+  },
+  {
+    name: "calculate_uk_rro_award",
+    description: "Run the empirical 7-case step-adjustment UK Property Tribunal RRO quantum calculator (60% s.72 HMO / 40% s.95 Selective baseline + Acheampong utility & Universal Credit s.44(3) deductions).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        monthly_rent_gbp: { type: "number", description: "Monthly gross rent in GBP", default: 1500 },
+        months_unlicensed: { type: "integer", description: "Months claimed (1..24 under Renters' Rights Act 2026)", default: 12 },
+        universal_credit_housing_gbp: { type: "number", description: "Monthly Universal Credit housing element in GBP", default: 0 },
+        utilities_included_monthly_gbp: { type: "number", description: "Monthly landlord-paid utilities included in rent in GBP", default: 150 },
+        region: { type: "string", description: "Tribunal region", default: "London" },
+        offence_type: { type: "string", description: "Offence category (Unlicensed HMO (s.72) or Selective Licensing (s.95))", default: "Unlicensed HMO (s.72)" },
+        mitigation_factors: { type: "string", description: "Comma-separated s.44 factors" }
+      }
+    }
+  },
+  {
+    name: "audit_private_rro_claim",
+    description: "Stateless ephemeral audit of an RRO application or decision excerpt against the 281-decision GOV.UK tribunal corpus.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        claim_text: { type: "string", description: "Claim or decision text to audit" },
+        region: { type: "string", description: "Optional tribunal region" },
+        offence_type: { type: "string", description: "Optional offence type" },
+        claimed_gbp: { type: "number", description: "Optional claimed amount in GBP" }
+      },
+      required: ["claim_text"]
+    }
+  },
+  {
+    name: "calculate_three_clear_days",
+    description: "Calculate LGA 1972 Schedule 12 para 10(2)(b) & s.243 Three Clear Days summons & agenda publication deadline using live GOV.UK bank holidays.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        meeting: { type: "string", description: "Meeting date in YYYY-MM-DD format", default: "2026-11-16" },
+        division: { type: "string", description: "UK bank holiday division", default: "england-and-wales" }
+      }
+    }
+  },
+  {
+    name: "calculate_s137_and_gpc",
+    description: "Calculate FY 2026/27 LGA 1972 Section 137 (£11.60/elector) spend cap and Localism Act 2011 General Power of Competence eligibility.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        electors: { type: "integer", description: "Electors on 1 April roll", default: 1200 },
+        seats: { type: "integer", description: "Total council seats", default: 11 },
+        elected: { type: "integer", description: "Elected councillors (excluding co-opted)", default: 7 },
+        cilca: { type: "boolean", description: "Whether clerk holds CiLCA / Level 4 qualification", default: false },
+        spend: { type: "number", description: "Proposed s.137 spend in GBP", default: 4500 },
+        fy: { type: "string", description: "Financial year (2024/25, 2025/26, 2026/27)", default: "2026/27" }
+      }
+    }
+  },
+  {
+    name: "check_charity_2026_thresholds",
+    description: "Check 30 September 2026 reformed Charity Commission Independent Examination (£40k), Receipts & Payments (£500k), Audit (£1.5m), and SORP 2026 tiers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        income: { type: "number", description: "Annual gross income in GBP", default: 35000 },
+        assets: { type: "number", description: "Gross assets in GBP", default: 150000 },
+        structure: { type: "string", description: "unincorporated_or_cio or charitable_company", default: "unincorporated_or_cio" },
+        fye: { type: "string", description: "Financial year end YYYY-MM-DD", default: "2027-03-31" }
+      }
+    }
+  },
+  {
+    name: "calculate_hmrc_bik_50pct_cap",
+    description: "Calculate HMRC Mandatory Payrolling of Benefits in Kind (BiKs) 50% overriding cash-pay regulatory limit and carry-forward schedule.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cash_salary: { type: "number", description: "Annual cash salary in GBP", default: 18000 },
+        bik: { type: "number", description: "Annual notional BiK cash equivalent in GBP", default: 36000 },
+        periods: { type: "integer", description: "Pay periods per year (12, 26, 52)", default: 12 }
+      }
+    }
+  }
+];
+
+async function handleMcpRpcMessage(msg, isInternal) {
+  if (!msg || typeof msg !== "object") {
+    return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid JSON-RPC Request" } };
+  }
+  const id = msg.id !== undefined ? msg.id : null;
+  const method = String(msg.method || "");
+  const params = msg.params || {};
+
+  if (method === "initialize") {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: {
+          name: "uk-parish-charity-rro-statutory-mcp",
+          version: "1.3.0",
+          url: "https://parish.technoplusit.co.uk/mcp"
+        }
+      }
+    };
+  }
+  if (method === "notifications/initialized" || method === "ping") {
+    return { jsonrpc: "2.0", id, result: {} };
+  }
+  if (method === "tools/list") {
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: { tools: MCP_TOOLS_MANIFEST }
+    };
+  }
+  if (method === "tools/call") {
+    const toolName = String(params.name || "");
+    const args = params.arguments || {};
+    let toolOut = null;
+    if (toolName === "search_uk_rro_precedents") {
+      toolOut = searchRroPrecedentsEdge(args);
+      await recordRroEdgeEvent("search", isInternal);
+    } else if (toolName === "calculate_uk_rro_award") {
+      toolOut = calculateRroAwardEdge(args);
+      await recordRroEdgeEvent("calculator_run", isInternal);
+    } else if (toolName === "audit_private_rro_claim") {
+      toolOut = auditPrivateRroClaimEdge(args);
+      await recordRroEdgeEvent("private_audit", isInternal);
+    } else if (toolName === "calculate_three_clear_days") {
+      const bh = await fetchBankHolidays(args.division || "england-and-wales");
+      toolOut = calcThreeClearDays(args.meeting || "2026-11-16", bh.holidays);
+    } else if (toolName === "calculate_s137_and_gpc") {
+      toolOut = calcS137AndGpc(args.electors ?? 1200, args.seats ?? 11, args.elected ?? 7, Boolean(args.cilca), args.spend ?? 4500, args.fy || "2026/27");
+    } else if (toolName === "check_charity_2026_thresholds") {
+      toolOut = checkCharity2026Thresholds(args.income ?? 35000, args.assets ?? 150000, args.structure || "unincorporated_or_cio", args.fye || "2027-03-31");
+    } else if (toolName === "calculate_hmrc_bik_50pct_cap") {
+      toolOut = calcHmrcBikCap(args.cash_salary ?? 18000, args.bik ?? 36000, args.periods ?? 12);
+    } else {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Unknown MCP tool: ${toolName}` }
+      };
+    }
+    return {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [{ type: "text", text: JSON.stringify(toolOut, null, 2) }],
+        structuredContent: toolOut,
+        isError: false
+      }
+    };
+  }
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32601, message: `Method not found: ${method}` }
+  };
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Accept, MCP-Protocol-Version",
+      "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+      "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    };
+    const htmlHeaders = {
+      ...corsHeaders,
+      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      "Content-Type": "text/html; charset=utf-8",
     };
 
     if (request.method === "OPTIONS") {
@@ -2372,6 +2568,48 @@ export default {
     const isInternal = ["1", "true", "yes"].includes(
       String(url.searchParams.get("internal") || request.headers.get("X-Internal-Smoke-Test") || "").toLowerCase()
     );
+
+    if (url.pathname === "/mcp" || url.pathname === "/mcp/") {
+      if (request.method === "GET") {
+        return Response.json(
+          {
+            status: "ok",
+            protocol: "Model Context Protocol (Streamable HTTP JSON-RPC 2.0)",
+            protocolVersion: "2025-03-26",
+            serverInfo: {
+              name: "uk-parish-charity-rro-statutory-mcp",
+              version: "1.3.0",
+              endpoint: "https://parish.technoplusit.co.uk/mcp",
+            },
+            llm_tokens_per_call: 0,
+            personal_data_processed: false,
+            tools_count: MCP_TOOLS_MANIFEST.length,
+            tools: MCP_TOOLS_MANIFEST,
+          },
+          { headers: corsHeaders }
+        );
+      }
+      if (request.method === "POST") {
+        let payload;
+        try {
+          payload = await request.json();
+        } catch (_) {
+          return Response.json(
+            { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error: invalid JSON" } },
+            { status: 400, headers: corsHeaders }
+          );
+        }
+        if (Array.isArray(payload)) {
+          const batchOut = [];
+          for (const item of payload) {
+            batchOut.push(await handleMcpRpcMessage(item, isInternal));
+          }
+          return Response.json(batchOut, { headers: corsHeaders });
+        }
+        const rpcOut = await handleMcpRpcMessage(payload, isInternal);
+        return Response.json(rpcOut, { headers: corsHeaders });
+      }
+    }
 
     if (url.pathname === "/sitemap.xml") {
       return new Response(RRO_SITEMAP_XML, {
@@ -2393,7 +2631,7 @@ export default {
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
       return new Response(RRO_HTML_PAGE, {
-        headers: { ...corsHeaders, "Content-Type": "text/html; charset=utf-8" },
+        headers: htmlHeaders,
       });
     }
 
@@ -2424,15 +2662,24 @@ export default {
             return Response.json(rendered, { headers: corsHeaders });
           }
           return new Response(rendered, {
-            headers: { ...corsHeaders, "Content-Type": "text/html; charset=utf-8" },
+            headers: htmlHeaders,
           });
         }
+        return Response.json(
+          { status: "error", error: "RRO_PAGE_NOT_FOUND", slug },
+          { status: 404, headers: corsHeaders }
+        );
       }
     }
 
-    if (url.pathname === "/api/rro-search") {
+    if (
+      url.pathname === "/api/rro-search" ||
+      url.pathname === "/api/rro/search" ||
+      url.pathname === "/api/rro/search/"
+    ) {
       let params = {
         q: url.searchParams.get("q") || "",
+        borough: url.searchParams.get("borough") || url.searchParams.get("council") || "",
         region: url.searchParams.get("region") || "",
         offence_type: url.searchParams.get("offence_type") || url.searchParams.get("offence") || "",
         mitigation: url.searchParams.get("mitigation") || "",
@@ -2463,7 +2710,11 @@ export default {
       return Response.json(res, { headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/rro-calculate") {
+    if (
+      url.pathname === "/api/rro-calculate" ||
+      url.pathname === "/api/rro/calculate" ||
+      url.pathname === "/api/rro/calculate/"
+    ) {
       let params = {
         monthly_rent_gbp: url.searchParams.get("monthly_rent_gbp") || url.searchParams.get("rent") || "1500",
         months_unlicensed: url.searchParams.get("months_unlicensed") || url.searchParams.get("months_claimed") || url.searchParams.get("months") || "12",
@@ -2507,13 +2758,18 @@ export default {
       return Response.json(calcRes, { headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/rro-buy-pack") {
+    if (
+      url.pathname === "/api/rro-buy-pack" ||
+      url.pathname === "/api/rro/buy-pack" ||
+      url.pathname === "/api/rro/buy-pack/"
+    ) {
       const region = url.searchParams.get("region") || "London";
       const partyRole = url.searchParams.get("party_role") || url.searchParams.get("role") || "landlord_defence";
       const stats = await recordRroEdgeEvent("buy_pack_click", isInternal);
       return Response.json(
         {
           status: "ok",
+          checkout_mode: "intent_validation_smoke_test_instant_sample",
           product: "UK Property Tribunal RRO Complete Regional Defence & Precedent Dossier Pack",
           price_gbp: 29,
           region,
@@ -2536,7 +2792,11 @@ export default {
       );
     }
 
-    if (url.pathname === "/api/rro-audit-pdf") {
+    if (
+      url.pathname === "/api/rro-audit-pdf" ||
+      url.pathname === "/api/rro/audit-pdf" ||
+      url.pathname === "/api/rro/audit-pdf/"
+    ) {
       let payload = {
         claim_text: url.searchParams.get("claim_text") || url.searchParams.get("text") || "",
         region: url.searchParams.get("region") || "",
@@ -2567,16 +2827,18 @@ export default {
       return Response.json(AGENT_JSON, { headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/health") {
+    if (url.pathname === "/api/health" || url.pathname === "/health" || url.pathname === "/healthz") {
       return Response.json(
         {
           status: "ok",
           service: "uk-parish-charity-statutory-almanac",
-          version: "1.2.0",
+          version: "1.3.0",
           live_url: "https://parish.technoplusit.co.uk",
+          mcp_endpoint: "https://parish.technoplusit.co.uk/mcp",
           llm_tokens_per_call: 0,
           personal_data_processed: false,
           capabilities: [
+            "mcp_streamable_http_jsonrpc_2_0",
             "three_clear_days_lga1972",
             "agar_public_rights_si2015_234",
             "ons_postcode_parish_lookup",
@@ -2732,7 +2994,7 @@ export default {
           status: "ok",
           retrieved_at_utc: new Date().toISOString(),
           service: "uk-parish-charity-statutory-almanac",
-          version: "1.2.0",
+          version: "1.3.0",
           three_clear_days_notice: calcThreeClearDays(meeting, bh.holidays),
           agar_public_rights_window: calcAgarWindow(year, commencement, bh.holidays),
           s137_and_gpc_eligibility: calcS137AndGpc(electors, seats, elected, cilca, spend, "2026/27"),
@@ -2744,8 +3006,42 @@ export default {
       );
     }
 
-    return new Response(HTML_PAGE, {
-      headers: { ...corsHeaders, "Content-Type": "text/html; charset=utf-8" },
-    });
+    if (url.pathname.startsWith("/api/")) {
+      return Response.json(
+        {
+          status: "error",
+          error: "API_ENDPOINT_NOT_FOUND",
+          path: url.pathname,
+          available_endpoints: [
+            "/mcp",
+            "/api/health",
+            "/api/rro/stats",
+            "/api/rro/search",
+            "/api/rro/calculate",
+            "/api/rro/audit-pdf",
+            "/api/rro/buy-pack",
+            "/api/almanac",
+            "/api/three-clear-days",
+            "/api/s137-gpc",
+            "/api/charity-thresholds",
+            "/api/hmrc-bik-cap",
+            "/api/pdf-clause-extract",
+            "/api/apify-mcp-lint"
+          ],
+        },
+        { status: 404, headers: corsHeaders }
+      );
+    }
+
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return new Response(HTML_PAGE, {
+        headers: htmlHeaders,
+      });
+    }
+
+    return Response.json(
+      { status: "error", error: "NOT_FOUND", path: url.pathname },
+      { status: 404, headers: corsHeaders }
+    );
   },
 };
