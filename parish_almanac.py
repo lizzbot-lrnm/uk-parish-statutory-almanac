@@ -1278,3 +1278,20 @@ def render_uk_rro_seo_page_html(slug: str) -> str | None:
     from seo_router import render_seo_page_html as _seo_html_impl
 
     return _seo_html_impl(slug)
+
+
+def get_uk_rro_step_adjustments_benchmark() -> dict[str, Any]:
+    """
+    Return the Worf-verified 7-case RRO step-adjustment benchmark (`rro_step_adjustments_7cases.json`):
+    empirical baseline medians (`60.0%` for s.72 HMO licensing, `40.0%` for s.95 selective licensing)
+    and the 7 cited step-adjustment precedents (`LON/00BH/HMG/2025/0616` et al.).
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import load_rro_step_adjustments_benchmark as _bench_impl
+
+    return _bench_impl()
