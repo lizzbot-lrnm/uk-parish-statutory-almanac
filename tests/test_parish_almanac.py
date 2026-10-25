@@ -262,3 +262,22 @@ def test_parish_almanac_pdf_clause_extractor_integration() -> None:
     assert res["tenant_isolation_proof"]["shared_database_used"] is False
     assert res["extracted_clauses"]["s106_planning_obligations"]["total_quantified_contributions_gbp"] == 145000.0
     assert res["benchmark_telemetry"]["llm_tokens_used"] == 0
+
+
+def test_parish_almanac_rro_precedent_finder_and_ephemeral_audit() -> None:
+    res = pa.search_uk_rro_precedents(q="LON/00AJ/HMG/2025/0666")
+    assert res["isolation_mode"] == "OGL-v3.0-read-only"
+    assert len(res["results"]) >= 1
+    assert res["results"][0]["case_ref"] == "LON/00AJ/HMG/2025/0666"
+    assert res["results"][0]["awarded_gbp"] == 8400.0
+    assert res["results"][0]["award_pct_of_rent"] == 40.0
+
+    audit = pa.audit_private_rro_claim_or_pdf(
+        claim_text="Unlicensed HMO under section 72(1) in Ealing, London. Total rent claimed £18,000 inclusive of utilities.",
+        region_hint="London",
+        claimed_gbp_hint=18000.0,
+    )
+    assert audit["ephemeral_wiped"] is True
+    assert audit["public_db_mode"] == "OGL-v3.0-read-only"
+    assert audit["private_claim_summary"]["claimed_gbp_evaluated"] == 18000.0
+    assert len(audit["comparable_ogl_precedents"]) >= 3

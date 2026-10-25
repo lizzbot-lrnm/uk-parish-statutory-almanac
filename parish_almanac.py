@@ -1080,3 +1080,65 @@ def extract_uk_scanned_pdf_clauses(
         semantic_query=semantic_query,
         top_k=top_k,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 North Star Integration (25 Oct 2026):
+# UK Property Tribunal Rent Repayment Order (RRO) & Section 13 Precedent Finder
+# ---------------------------------------------------------------------------
+
+def search_uk_rro_precedents(
+    q: str = "",
+    region: str = "",
+    offence_type: str = "",
+    mitigation: str = "",
+    max_pct: float | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """
+    Search the read-only (`?mode=ro`) SQLite FTS5 + deterministic vector index of 80 real
+    GOV.UK Residential Property Tribunal Rent Repayment Order (RRO) decisions.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import search_rro_precedents as _search_impl
+
+    return _search_impl(
+        q=q,
+        region=region,
+        offence_type=offence_type,
+        mitigation=mitigation,
+        max_pct=max_pct,
+        limit=limit,
+    )
+
+
+def audit_private_rro_claim_or_pdf(
+    payload_bytes: bytes | None = None,
+    claim_text: str = "",
+    region_hint: str = "",
+    claimed_gbp_hint: float | None = None,
+) -> dict[str, Any]:
+    """
+    Stateless per-request private RRO claim / PDF audit.
+    Processes private user PDF bytes or claim text inside an isolated ephemeral workspace
+    and deterministically wipes all temporary files in `finally:`.
+    """
+    import sys
+    from pathlib import Path
+
+    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    if rro_dir not in sys.path:
+        sys.path.insert(0, rro_dir)
+    from rro_engine import audit_private_pdf_bytes as _audit_impl
+
+    return _audit_impl(
+        payload_bytes=payload_bytes,
+        claim_text=claim_text,
+        region_hint=region_hint,
+        claimed_gbp_hint=claimed_gbp_hint,
+    )
