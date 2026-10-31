@@ -35,6 +35,25 @@ _BANK_HOLIDAY_CACHE: dict[str, Any] = {"fetched_at": 0.0, "data": None}
 _CACHE_TTL_SECONDS = 3600.0
 
 
+
+def _sibling_repo_dir(name: str) -> str:
+    """Locate a sibling revenue repo; works from the main checkout and from git worktrees.
+
+    Order: $PARISH_SIBLINGS_ROOT/<name>, ../<name>, /workspace/revenue/<name>.
+    """
+    import os
+    from pathlib import Path as _P
+    here = _P(__file__).resolve()
+    candidates = []
+    env_root = os.environ.get("PARISH_SIBLINGS_ROOT")
+    if env_root:
+        candidates.append(_P(env_root) / name)
+    candidates += [here.parents[1] / name, _P("/workspace/revenue") / name]
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    return str(candidates[0])
+
 def fetch_uk_bank_holidays(
     division: str = "england-and-wales",
     client: httpx.Client | None = None,
@@ -1065,7 +1084,7 @@ def extract_uk_scanned_pdf_clauses(
     import sys
     from pathlib import Path
 
-    mcp_dir = str(Path(__file__).resolve().parents[1] / "uk-us-compliance-mcp-actor")
+    mcp_dir = _sibling_repo_dir("uk-us-compliance-mcp-actor")
     if mcp_dir not in sys.path:
         sys.path.insert(0, mcp_dir)
     from pdf_clause_extractor import extract_uk_scanned_pdf_clauses as _impl
@@ -1105,7 +1124,7 @@ def search_uk_rro_precedents(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import search_rro_precedents as _search_impl
@@ -1143,7 +1162,7 @@ def calculate_uk_rro_award_and_schedule(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import calculate_rro_award_and_schedule as _calc_impl
@@ -1176,7 +1195,7 @@ def record_uk_rro_buy_pack_intent(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import record_rro_buy_pack_intent as _buy_impl
@@ -1205,7 +1224,7 @@ def audit_private_rro_claim_or_pdf(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import audit_private_pdf_bytes as _audit_impl
@@ -1226,7 +1245,7 @@ def get_uk_rro_usage_stats() -> dict[str, Any]:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import get_rro_usage_stats as _stats_impl
@@ -1242,7 +1261,7 @@ def record_uk_rro_usage_event(event_type: str, *, internal: bool = False) -> dic
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import record_rro_usage_event as _rec_impl
@@ -1257,7 +1276,7 @@ def get_uk_rro_seo_page(slug: str) -> dict[str, Any] | None:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from seo_router import get_seo_page as _seo_page_impl
@@ -1272,7 +1291,7 @@ def render_uk_rro_seo_page_html(slug: str) -> str | None:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from seo_router import render_seo_page_html as _seo_html_impl
@@ -1289,7 +1308,7 @@ def get_uk_rro_step_adjustments_benchmark() -> dict[str, Any]:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import load_rro_step_adjustments_benchmark as _bench_impl
@@ -1311,7 +1330,7 @@ def audit_ecommerce_seo_and_llms_readiness(
     import sys
     from pathlib import Path
 
-    auditor_dir = str(Path(__file__).resolve().parents[1] / "ecomm-seo-llms-auditor-mcp")
+    auditor_dir = _sibling_repo_dir("ecomm-seo-llms-auditor-mcp")
     if auditor_dir not in sys.path:
         sys.path.insert(0, auditor_dir)
     from seo_llms_engine import (
