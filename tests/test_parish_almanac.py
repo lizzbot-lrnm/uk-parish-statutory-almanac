@@ -299,3 +299,92 @@ def test_parish_almanac_rro_usage_stats_zero_pii() -> None:
     assert stats_after["total_pack_downloads"] == stats_before["total_pack_downloads"] + 1
     assert "north_star_7d_targets" in stats_after
     assert "progress_pct" in stats_after
+
+
+def test_seo_audit_and_api_seo_audit_routes() -> None:
+    import json
+    import subprocess
+
+    # 1. Test Python bridge helper in parish_almanac.py
+    demo_res = pa.audit_ecommerce_seo_and_llms_readiness("example-store.myshopify.com", demo=True)
+    assert demo_res["status"] == "ok"
+    assert demo_res["llm_tokens_used"] == 0
+    assert demo_res["quarantine_passed"] is True
+    assert demo_res["platform"] == "shopify"
+    assert 0 <= demo_res["overall_score"] <= 100
+    assert "sku" in demo_res["missing_jsonld_fields"]
+    assert "offers.priceCurrency" in demo_res["missing_jsonld_fields"]
+    assert demo_res["bot_permissions"]["GPTBot"] == "DISALLOWED"
+    assert demo_res["bot_permissions"]["ClaudeBot"] == "DISALLOWED"
+    assert demo_res["bot_permissions"]["OAI-SearchBot"] == "ALLOWED"
+    assert demo_res["generated_llms_txt_preview"].startswith("# Example Skincare Store")
+    assert demo_res["corrected_product_jsonld"]["@type"] == "Product"
+
+    # 2. Test SSRF protection on Python bridge helper
+    ssrf_res = pa.audit_ecommerce_seo_and_llms_readiness("http://127.0.0.1/admin", demo=False)
+    assert ssrf_res["status"] == "error"
+    assert ssrf_res["ssrf_blocked"] is True
+
+    # 3. Test Cloudflare Worker (`worker.js`) routes: GET /seo-audit, GET /api/seo-audit, POST /api/seo-audit, SSRF block, /sitemap.xml, /llms.txt
+    worker_path = Path(__file__).resolve().parents[1] / "worker.js"
+    node_script = f"""
+import worker from {json.dumps(worker_path.as_uri())};
+
+async function run() {{
+  const rPage = await worker.fetch(new Request("https://parish.technoplusit.co.uk/seo-audit"));
+  const pageHtml = await rPage.text();
+
+  const rApi = await worker.fetch(new Request("https://parish.technoplusit.co.uk/api/seo-audit?domain=example-store.myshopify.com&demo=1"));
+  const apiJson = await rApi.json();
+
+  const rPost = await worker.fetch(new Request("https://parish.technoplusit.co.uk/api/seo-audit", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify({{ domain: "example-store.myshopify.com", demo: true }})
+  }}));
+  const postJson = await rPost.json();
+
+  const rSsrf = await worker.fetch(new Request("https://parish.technoplusit.co.uk/api/seo-audit?domain=127.0.0.1"));
+  const ssrfJson = await rSsrf.json();
+
+  const rSitemap = await worker.fetch(new Request("https://parish.technoplusit.co.uk/sitemap.xml"));
+  const sitemapXml = await rSitemap.text();
+
+  const rLlms = await worker.fetch(new Request("https://parish.technoplusit.co.uk/llms.txt"));
+  const llmsTxt = await rLlms.text();
+
+  console.log(JSON.stringify({{
+    pageStatus: rPage.status,
+    hasGraderTitle: pageHtml.includes("Readiness Grader"),
+    apiStatus: rApi.status,
+    apiJson,
+    postStatus: rPost.status,
+    postScore: postJson.overall_score,
+    ssrfStatus: rSsrf.status,
+    ssrfBlocked: ssrfJson.ssrf_blocked,
+    sitemapHasSeoAudit: sitemapXml.includes("https://parish.technoplusit.co.uk/seo-audit"),
+    llmsHasSeoAudit: llmsTxt.includes("/seo-audit"),
+  }}));
+}}
+run();
+"""
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["pageStatus"] == 200
+    assert out["hasGraderTitle"] is True
+    assert out["apiStatus"] == 200
+    assert out["apiJson"]["status"] == "ok"
+    assert out["apiJson"]["bot_permissions"]["GPTBot"] == "DISALLOWED"
+    assert out["apiJson"]["bot_permissions"]["OAI-SearchBot"] == "ALLOWED"
+    assert "sku" in out["apiJson"]["missing_jsonld_fields"]
+    assert out["postStatus"] == 200
+    assert out["postScore"] == out["apiJson"]["overall_score"]
+    assert out["ssrfStatus"] == 400
+    assert out["ssrfBlocked"] is True
+    assert out["sitemapHasSeoAudit"] is True
+    assert out["llmsHasSeoAudit"] is True

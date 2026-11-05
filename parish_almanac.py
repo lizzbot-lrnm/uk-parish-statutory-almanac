@@ -35,6 +35,25 @@ _BANK_HOLIDAY_CACHE: dict[str, Any] = {"fetched_at": 0.0, "data": None}
 _CACHE_TTL_SECONDS = 3600.0
 
 
+
+def _sibling_repo_dir(name: str) -> str:
+    """Locate a sibling revenue repo; works from the main checkout and from git worktrees.
+
+    Order: $PARISH_SIBLINGS_ROOT/<name>, ../<name>, /workspace/revenue/<name>.
+    """
+    import os
+    from pathlib import Path as _P
+    here = _P(__file__).resolve()
+    candidates = []
+    env_root = os.environ.get("PARISH_SIBLINGS_ROOT")
+    if env_root:
+        candidates.append(_P(env_root) / name)
+    candidates += [here.parents[1] / name, _P("/workspace/revenue") / name]
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    return str(candidates[0])
+
 def fetch_uk_bank_holidays(
     division: str = "england-and-wales",
     client: httpx.Client | None = None,
@@ -1065,7 +1084,7 @@ def extract_uk_scanned_pdf_clauses(
     import sys
     from pathlib import Path
 
-    mcp_dir = str(Path(__file__).resolve().parents[1] / "uk-us-compliance-mcp-actor")
+    mcp_dir = _sibling_repo_dir("uk-us-compliance-mcp-actor")
     if mcp_dir not in sys.path:
         sys.path.insert(0, mcp_dir)
     from pdf_clause_extractor import extract_uk_scanned_pdf_clauses as _impl
@@ -1105,7 +1124,7 @@ def search_uk_rro_precedents(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import search_rro_precedents as _search_impl
@@ -1143,7 +1162,7 @@ def calculate_uk_rro_award_and_schedule(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import calculate_rro_award_and_schedule as _calc_impl
@@ -1176,7 +1195,7 @@ def record_uk_rro_buy_pack_intent(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import record_rro_buy_pack_intent as _buy_impl
@@ -1205,7 +1224,7 @@ def audit_private_rro_claim_or_pdf(
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import audit_private_pdf_bytes as _audit_impl
@@ -1226,7 +1245,7 @@ def get_uk_rro_usage_stats() -> dict[str, Any]:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import get_rro_usage_stats as _stats_impl
@@ -1242,7 +1261,7 @@ def record_uk_rro_usage_event(event_type: str, *, internal: bool = False) -> dic
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import record_rro_usage_event as _rec_impl
@@ -1257,7 +1276,7 @@ def get_uk_rro_seo_page(slug: str) -> dict[str, Any] | None:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from seo_router import get_seo_page as _seo_page_impl
@@ -1272,7 +1291,7 @@ def render_uk_rro_seo_page_html(slug: str) -> str | None:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from seo_router import render_seo_page_html as _seo_html_impl
@@ -1289,9 +1308,141 @@ def get_uk_rro_step_adjustments_benchmark() -> dict[str, Any]:
     import sys
     from pathlib import Path
 
-    rro_dir = str(Path(__file__).resolve().parents[1] / "uk-property-tribunal-rro-finder")
+    rro_dir = _sibling_repo_dir("uk-property-tribunal-rro-finder")
     if rro_dir not in sys.path:
         sys.path.insert(0, rro_dir)
     from rro_engine import load_rro_step_adjustments_benchmark as _bench_impl
 
     return _bench_impl()
+
+
+def audit_ecommerce_seo_and_llms_readiness(
+    domain_or_url: str = "example-store.myshopify.com",
+    *,
+    demo: bool = False,
+    max_links: int = 10,
+    generate_remediation_pack: bool = True,
+) -> dict[str, Any]:
+    """
+    Deterministic 0-token E-Commerce & Shopify JSON-LD Schema, AI Crawler (`robots.txt`),
+    `/products.json` Feed, and `/llms.txt` Readiness Probe backing `/api/seo-audit`.
+    """
+    import sys
+    from pathlib import Path
+
+    auditor_dir = _sibling_repo_dir("ecomm-seo-llms-auditor-mcp")
+    if auditor_dir not in sys.path:
+        sys.path.insert(0, auditor_dir)
+    from seo_llms_engine import (
+        DEFAULT_SAMPLE_HTML,
+        DEFAULT_SAMPLE_PRODUCTS_JSON,
+        DEFAULT_SAMPLE_ROBOTS_TXT,
+        audit_store_url,
+    )
+
+    raw = (domain_or_url or "example-store.myshopify.com").strip()
+    is_demo = demo or raw.lower() in (
+        "example-store.myshopify.com",
+        "https://example-store.myshopify.com",
+        "http://example-store.myshopify.com",
+        "demo",
+    )
+
+    if is_demo:
+        demo_html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Example Skincare Store | Clinical Barrier Repair</title>
+  <meta name="description" content="Clinical ceramide skincare with transparent ingredients and fast worldwide shipping." />
+  <link rel="canonical" href="https://example-store.myshopify.com/" />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    "name": "Ceramide Barrier Serum 50ml",
+    "image": ["https://example-store.myshopify.com/cdn/serum.jpg"],
+    "description": "Concentrated lipid barrier repair serum.",
+    "brand": {"@type": "Brand", "name": "Example Skincare"},
+    "offers": {
+      "@type": "Offer",
+      "price": "44.00"
+    }
+  }
+  </script>
+</head>
+<body>
+  <a href="https://example-store.myshopify.com/collections/all">Shop All</a>
+  <a href="https://example-store.myshopify.com/products/ceramide-barrier-serum">Ceramide Serum</a>
+</body>
+</html>"""
+        demo_robots = """User-agent: GPTBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: *
+Allow: /
+Sitemap: https://example-store.myshopify.com/sitemap.xml
+"""
+
+        def _demo_fetcher(u: str) -> tuple[int, str]:
+            if u.endswith("/robots.txt"):
+                return 200, demo_robots
+            if "/products.json" in u:
+                return 200, json.dumps(DEFAULT_SAMPLE_PRODUCTS_JSON)
+            if u.endswith("/llms.txt"):
+                return 404, ""
+            return 200, demo_html
+
+        res = audit_store_url(
+            url="https://example-store.myshopify.com",
+            max_links=max_links,
+            generate_remediation_pack=generate_remediation_pack,
+            http_fetcher=_demo_fetcher,
+            hop_fetcher=lambda u: (200, {}),
+            use_sample_fallback=True,
+        )
+    else:
+        res = audit_store_url(
+            url=raw,
+            max_links=max_links,
+            generate_remediation_pack=generate_remediation_pack,
+            use_sample_fallback=False,
+        )
+
+    if res.get("status") != "ok":
+        return res
+
+    return {
+        "status": "ok",
+        "probe": "parish.technoplusit.co.uk/seo-audit",
+        "llm_tokens_used": 0,
+        "quarantine_passed": res["quarantine_passed"],
+        "audit_mode": "instant_demo_fixture" if is_demo else res.get("audit_mode", "live_network"),
+        "url": res["url"],
+        "domain": res["domain"],
+        "platform": res["platform"],
+        "overall_score": res["overall_score"],
+        "jsonld_score": res["jsonld_audit"]["jsonld_score"],
+        "ai_crawler_score": res["ai_robots_audit"]["ai_discoverability_score"],
+        "llms_txt_score": res["llms_txt_audit"]["llms_txt_score"],
+        "shopify_feed_score": res["shopify_audit"]["shopify_feed_score"],
+        "missing_jsonld_fields": res["jsonld_audit"]["missing_fields"],
+        "jsonld_error_codes": res["jsonld_audit"]["error_codes"],
+        "bot_permissions": res["ai_robots_audit"]["bot_permissions"],
+        "disallowed_ai_bots": res["ai_robots_audit"]["disallowed_bots"],
+        "llms_txt_present": res["llms_txt_audit"]["llms_txt_present"],
+        "generated_llms_txt_preview": res["llms_txt_audit"]["generated_llms_txt"],
+        "corrected_product_jsonld": (res.get("remediation_pack") or {}).get("corrected_product_jsonld"),
+        "apify_actor": "technoplusit/ecomm-seo-llms-auditor-mcp",
+    }

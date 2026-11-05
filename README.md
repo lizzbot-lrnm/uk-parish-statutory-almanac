@@ -18,8 +18,16 @@ Live Streamable HTTP MCP Endpoint (`JSON-RPC 2.0`): **https://parish.technoplusi
 6. **UK Scanned Legal Deed & Clause Extractor (`/api/pdf-clause-extract`)** — Section 106 obligations, Companies House MR01 negative pledges, and Charity Independent Examiner reports.
 7. **Apify-to-MCP `input_schema.json` Silent Bug Linter & Auto-Fixer (`/api/apify-mcp-lint`)** (`required` + `default` silent drop protection & `prefill` enforcement)
 
+
+## Export Formal Tribunal Appeal Pack — £24 (Stripe Checkout, IDEA-03)
+The `/rro` calculator has a single paid CTA, **"Export Formal Tribunal Appeal Pack — £24"**, using a hosted Stripe Checkout Session redirect.
+Telemetry: [`/api/rro/telemetry`](https://parish.technoplusit.co.uk/api/rro/telemetry) (`checkout_starts`, `paid`, `since`, `day7_kill_rule`).
+**Day-7 kill rule:** 7 days after `RRO_CHECKOUT_LIVE_SINCE` (live keys on), if `checkout_starts < 10` OR `paid == 0`, the product is killed.
+Config, routes, fail-closed behaviour and deploy steps: [`deploy/IDEA03_STRIPE_CHECKOUT.md`](deploy/IDEA03_STRIPE_CHECKOUT.md).
+
 ## Running Tests
 
 ```bash
 pytest -v tests/test_parish_almanac.py
+node --test tests/rro_checkout.test.mjs
 ```
