@@ -85,3 +85,25 @@ test("/api/almanac: malformed commencement or year is a 400 before any upstream 
   }
   assert.equal(fetched, false);
 });
+
+test("calcHmrcBikCap: non-numeric bonus_amount / cash_schedule entries fall back to 0, never NaN", async () => {
+  const q = "/api/hmrc-bik-cap?cash_salary=18000&bik=36000&periods=12";
+  const def = await (await worker.fetch(get(q), {})).json();
+  const badBonus = await (await worker.fetch(get(q + "&bonus_month=3&bonus_amount=abc"), {})).json();
+  assert.deepEqual(badBonus, await (await worker.fetch(get(q + "&bonus_month=3&bonus_amount=0"), {})).json());
+  assert.deepEqual(badBonus, def);
+  const badSched = await (await worker.fetch(get(q + "&cash_schedule=abc,1500"), {})).json();
+  const zeroSched = await (await worker.fetch(get(q + "&cash_schedule=0,1500"), {})).json();
+  assert.deepEqual(badSched, zeroSched);
+});
+
+test("/health and /healthz are minimal {status:'ok'}; /api/health keeps the public discovery metadata", async () => {
+  for (const p of ["/health", "/healthz"]) {
+    const r = await worker.fetch(get(p), {});
+    assert.equal(r.status, 200);
+    assert.deepEqual(await r.json(), { status: "ok" });
+  }
+  const full = await (await worker.fetch(get("/api/health"), {})).json();
+  assert.equal(full.status, "ok");
+  assert.ok(full.mcp_endpoint);
+});

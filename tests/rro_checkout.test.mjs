@@ -21,7 +21,8 @@ const PREVIEW = { Cookie: previewCookie() };
 
 function fakeD1() {
   const db = new DatabaseSync(":memory:");
-  const norm = (sql) => sql.replace(/\?(\d+)/g, "?");
+  // D1 is SQLite: numbered ?NNN params bind by index (and may repeat), exactly as node:sqlite does.
+  const norm = (sql) => sql;
   const stmt = (sql, args = []) => ({
     bind: (...a) => stmt(sql, a),
     first: async () => db.prepare(norm(sql)).get(...args) ?? null,
@@ -506,4 +507,61 @@ test("L1: webhook rejects livemode that mismatches the configured mode or the se
   const ok = { type: "checkout.session.completed", data: { object: paidSession("cs_test_MODEOK0000000001") } };
   assert.equal((await (await worker.fetch(webhookReq(ok), e)).json()).recorded, true);
   assert.equal((await fullTelemetry(e)).paid, 1);
+});
+
+test("M-R1: over-limit checkout is refused before the retention purge or any data write", async () => {
+  noStripe();
+  const e = env();
+  const db = e.RRO_CHECKOUT_DB._db;
+  await worker.fetch(checkoutReq({}, { Cookie: "" }), e); // preview-less: 503, nothing written
+  db.exec("CREATE TABLE IF NOT EXISTS rro_rate_hits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, ip_hash TEXT NOT NULL, created_at_utc TEXT NOT NULL)");
+  // Fill the window for this IP by replaying allowed starts with Stripe failing (slots still count).
+  mockStripe(() => jsonResp({}, 500));
+  for (let i = 0; i < 5; i++) await worker.fetch(checkoutReq(), e);
+  seedStart(e, "cs_test_PURGEPROBE00000001");
+  db.prepare("UPDATE rro_checkout_events SET created_at_utc = ? WHERE session_id = ?").run(new Date(Date.now() - 49 * 3600000).toISOString(), "cs_test_PURGEPROBE00000001");
+  const hits = () => db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n;
+  const before = hits();
+  noStripe();
+  const r = await worker.fetch(checkoutReq(), e);
+  assert.equal(r.status, 429);
+  assert.equal(hits(), before, "a refused caller writes no rate-limit row");
+  assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_PURGEPROBE00000001").ip_hash, "seed", "a refused caller does not trigger the purge");
+});
+
+test("L-R2: rate limit check-and-insert is one atomic statement (concurrent callers cannot exceed max)", async () => {
+  let n = 0;
+  mockStripe(() => { n++; return jsonResp({ id: "cs_test_CONC" + String(n).padStart(12, "0"), url: "https://checkout.stripe.com/c/pay/c" + n }); });
+  const e = env();
+  const seen = [];
+  const realPrepare = e.RRO_CHECKOUT_DB.prepare;
+  e.RRO_CHECKOUT_DB.prepare = (sql) => { if (/rro_rate_hits/.test(sql)) seen.push(sql); return realPrepare(sql); };
+  const results = await Promise.all(Array.from({ length: 8 }, () => worker.fetch(checkoutReq(), e)));
+  const ok = results.filter((r) => r.status === 200).length;
+  assert.equal(ok, 5, "exactly max_starts (5) admitted, got " + ok);
+  assert.ok(results.some((r) => r.status === 429));
+  const limiterSql = seen.filter((s) => /^INSERT INTO rro_rate_hits/.test(s));
+  assert.ok(limiterSql.length > 0 && limiterSql.every((s) => /SELECT[\s\S]*WHERE \(SELECT COUNT\(\*\)/.test(s)), "limiter must be a single conditional INSERT ... SELECT");
+  assert.ok(!seen.some((s) => /^SELECT COUNT\(\*\) AS n FROM rro_rate_hits/.test(s)), "no separate read-then-write");
+});
+
+test("L-R3: telemetry bearer is compared as SHA-256 digests (length-independent); wrong/longer/shorter tokens refused", async () => {
+  const e = { ...env(), RRO_TELEMETRY_TOKEN: FAKE_TELEMETRY_TOKEN };
+  const call = (tok) => worker.fetch(getReq("/api/rro/telemetry", { Authorization: "Bearer " + tok }), e).then((r) => r.json());
+  const good = await call(FAKE_TELEMETRY_TOKEN);
+  const pub = await call("x");
+  assert.notDeepEqual(good, pub);
+  for (const t of [FAKE_TELEMETRY_TOKEN + "0", FAKE_TELEMETRY_TOKEN.slice(0, -1), "y".repeat(FAKE_TELEMETRY_TOKEN.length)]) {
+    assert.deepEqual(await call(t), pub);
+  }
+  const src = (await import("node:fs")).readFileSync(new URL("../src/rro_checkout.js", import.meta.url), "utf8");
+  assert.match(src, /rroTimingSafeEqualHex\(given, expected\)/);
+});
+
+test("L-R4: /rro is always private, no-store with Vary: Cookie (hidden, preview and live variants)", async () => {
+  for (const [e, h] of [[env(), {}], [env(), PREVIEW], [env({ STRIPE_SECRET_KEY: FAKE_LIVE_KEY, RRO_STRIPE_LIVE_ENABLED: "true" }), {}]]) {
+    const r = await worker.fetch(getReq("/rro", h), e);
+    assert.equal(r.headers.get("Cache-Control"), "private, no-store");
+    assert.match(r.headers.get("Vary") || "", /Cookie/);
+  }
 });

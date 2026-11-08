@@ -108,19 +108,21 @@ async function rroPurgeIpHashes(db, nowMs) {
   await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
 }
 
-// Read-then-reserve limiter: an over-limit caller is refused with a single read and NO write, so a
-// flood cannot extend its own lockout or amplify D1 writes. An allowed caller's slot is written BEFORE
-// any Stripe call, so failures still count.
+// Atomic check-and-reserve limiter: ONE conditional INSERT ... SELECT ... WHERE count < max, so two
+// concurrent requests cannot both pass on the same stale count (no read-then-write TOCTOU). An
+// over-limit caller inserts zero rows, so a flood cannot extend its own lockout or amplify D1 writes.
+// An allowed caller's slot is written BEFORE any Stripe call, so failures still count.
 async function rroRateLimitHit(db, bucket, ipHash, max, windowMinutes) {
   const nowIso = new Date().toISOString();
   const windowStart = new Date(Date.now() - windowMinutes * 60000).toISOString();
-  const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM rro_rate_hits WHERE bucket = ?1 AND ip_hash = ?2 AND created_at_utc >= ?3")
-    .bind(bucket, ipHash, windowStart)
-    .first();
-  if (Number((row && row.n) || 0) >= max) return false;
-  await db.prepare("INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) VALUES (?1, ?2, ?3)").bind(bucket, ipHash, nowIso).run();
-  return true;
+  const res = await db
+    .prepare(
+      "INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) SELECT ?1, ?2, ?3 " +
+        "WHERE (SELECT COUNT(*) FROM rro_rate_hits WHERE bucket = ?1 AND ip_hash = ?2 AND created_at_utc >= ?4) < ?5"
+    )
+    .bind(bucket, ipHash, nowIso, windowStart, max)
+    .run();
+  return Number((res && res.meta && res.meta.changes) || 0) === 1;
 }
 
 function rroCookie(request, name) {

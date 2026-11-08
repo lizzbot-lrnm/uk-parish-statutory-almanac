@@ -401,14 +401,14 @@ function calcHmrcBikCap(
   if (monthlyCashSchedule) {
     if (Array.isArray(monthlyCashSchedule)) {
       periodCashList = Array.from({ length: periods }, (_, idx) =>
-        idx < monthlyCashSchedule.length ? Math.round(Math.max(0, parseFloat(monthlyCashSchedule[idx] || 0)) * 100) / 100 : basePeriodCashPay
+        idx < monthlyCashSchedule.length ? Math.round(Math.max(0, numOr(monthlyCashSchedule[idx], 0)) * 100) / 100 : basePeriodCashPay
       );
       variableCashMode = true;
     } else if (typeof monthlyCashSchedule === "string" && monthlyCashSchedule.trim()) {
       const parts = monthlyCashSchedule.split(",").map((x) => x.trim()).filter(Boolean);
       if (parts.length > 0) {
         periodCashList = Array.from({ length: periods }, (_, idx) =>
-          idx < parts.length ? Math.round(Math.max(0, parseFloat(parts[idx] || 0)) * 100) / 100 : basePeriodCashPay
+          idx < parts.length ? Math.round(Math.max(0, numOr(parts[idx], 0)) * 100) / 100 : basePeriodCashPay
         );
         variableCashMode = true;
       }
@@ -416,7 +416,7 @@ function calcHmrcBikCap(
       for (const [k, v] of Object.entries(monthlyCashSchedule)) {
         const pIdx = parseInt(k, 10);
         if (pIdx >= 1 && pIdx <= periods) {
-          periodCashList[pIdx - 1] = Math.round(Math.max(0, parseFloat(v || 0)) * 100) / 100;
+          periodCashList[pIdx - 1] = Math.round(Math.max(0, numOr(v, 0)) * 100) / 100;
           variableCashMode = true;
         }
       }
@@ -424,7 +424,7 @@ function calcHmrcBikCap(
   }
 
   const bMonth = bonusMonth ? parseInt(bonusMonth, 10) : 0;
-  const bAmt = parseFloat(bonusAmount || 0);
+  const bAmt = numOr(bonusAmount, 0);
   if (bMonth >= 1 && bMonth <= periods && bAmt !== 0) {
     periodCashList[bMonth - 1] = Math.round(Math.max(0, periodCashList[bMonth - 1] + bAmt) * 100) / 100;
     variableCashMode = true;
@@ -2944,7 +2944,12 @@ export default {
       return Response.json(AGENT_JSON, { headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/health" || url.pathname === "/health" || url.pathname === "/healthz") {
+    if (url.pathname === "/health" || url.pathname === "/healthz") {
+      // Liveness probes stay minimal; public discovery metadata lives on /api/health, /mcp and agent.json.
+      return Response.json({ status: "ok" }, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    if (url.pathname === "/api/health") {
       return Response.json(
         {
           status: "ok",

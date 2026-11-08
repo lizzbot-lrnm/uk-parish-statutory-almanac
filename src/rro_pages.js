@@ -212,7 +212,7 @@ async function rroHandleCheckoutRoutes(request, env, url) {
   if (p === "/api/rro/telemetry") {
     if (request.method !== "GET" && request.method !== "HEAD") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "GET" });
     // T5: full counters/day-7 internals only with a bearer RRO_TELEMETRY_TOKEN (no CORS); public view is minimal.
-    if (rroTelemetryAuthorised(request, env)) return rroJson(await rroBuildTelemetry(env), 200);
+    if (await rroTelemetryAuthorised(request, env)) return rroJson(await rroBuildTelemetry(env), 200);
     return rroJson(rroPublicTelemetry(env), 200, { "Access-Control-Allow-Origin": "*" });
   }
   if (p === "/rro/pack/success") {
@@ -265,9 +265,9 @@ async function rroRenderRroPage(request, env, url) {
       '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">Stripe test checkout (preview only). ' + RRO_CTA_NOTE_TEXT + "</p>";
   }
   const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button).replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note);
-  const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer" };
+  // The page varies on the preview cookie: never let a shared cache serve one visitor's variant to another.
+  const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer", "Cache-Control": "private, no-store", Vary: "Cookie" };
   if (state === "test_preview") {
-    extra["Cache-Control"] = "private, no-store";
     if (viaLink) {
       // Strip the token from the URL bar, history and Referer: 302 to /rro carrying the signed cookie.
       const cookie = await rroPreviewCookieFor(rroPreviewSecret(env), Date.now() / 1000);

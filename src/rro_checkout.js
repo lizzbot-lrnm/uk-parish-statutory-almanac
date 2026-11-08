@@ -56,14 +56,16 @@ async function rroHandleCheckoutCreate(request, env) {
   const inputs = rroCleanInputs(raw);
 
   const db = env.RRO_CHECKOUT_DB;
-  await rroEnsureCheckoutSchema(db);
   const ipHash = await rroIpHash(request, env);
   if (!ipHash) return rroJson({ status: "error", error: "CHECKOUT_NOT_CONFIGURED" }, 503);
-  await rroPurgeIpHashes(db);
+  // Schema DDL is idempotent and runs once per isolate; the rate limit is the first data write, and
+  // the retention purge only runs for callers the limiter admitted (no write amplification on floods).
+  await rroEnsureCheckoutSchema(db);
   const allowed = await rroRateLimitHit(db, "checkout", ipHash, RRO_CHECKOUT_RATE_LIMIT.max_starts, RRO_CHECKOUT_RATE_LIMIT.window_minutes);
   if (!allowed) {
     return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(RRO_CHECKOUT_RATE_LIMIT.window_minutes * 60) });
   }
+  await rroPurgeIpHashes(db);
 
   const form = {
     mode: "payment",
@@ -228,12 +230,19 @@ function rroPublicTelemetry(env) {
   };
 }
 
-function rroTelemetryAuthorised(request, env) {
+// Compare fixed-length SHA-256 digests so neither the token's length nor a prefix match leaks via timing.
+async function rroTelemetryAuthorised(request, env) {
   const token = typeof (env && env.RRO_TELEMETRY_TOKEN) === "string" ? env.RRO_TELEMETRY_TOKEN : "";
   if (token.length < 24) return false;
   const auth = String(request.headers.get("Authorization") || "");
   if (!auth.startsWith("Bearer ")) return false;
-  return rroTimingSafeEqualHex(auth.slice(7), token);
+  const [given, expected] = await Promise.all([rroSha256Hex(auth.slice(7)), rroSha256Hex(token)]);
+  return rroTimingSafeEqualHex(given, expected);
+}
+
+async function rroSha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text)));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // T2: per-isolate paid-verdict cache (<=10 min), bounded. Cache API is used opportunistically too.
