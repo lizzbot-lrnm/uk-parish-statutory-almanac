@@ -22,6 +22,7 @@ import {
   rroVerifyStripeSignature,
   rroCleanInputs,
   rroOriginAllowed,
+  rroCheckoutIdempotencyKey,
   rroStripeRequest,
 } from "./rro_core.js";
 
@@ -83,7 +84,8 @@ async function rroHandleCheckoutCreate(request, env) {
   for (const [k, v] of Object.entries(inputs)) form["metadata[" + k + "]"] = v;
   if (mode.mode === "test") form["custom_text[submit][message]"] = RRO_TEST_MODE_LABEL + ".";
 
-  const res = await rroStripeRequest(env, "POST", "/v1/checkout/sessions", form);
+  const idemKey = await rroCheckoutIdempotencyKey(mode.mode, ipHash, inputs);
+  const res = await rroStripeRequest(env, "POST", "/v1/checkout/sessions", form, idemKey);
   if (!res.ok || !res.data || typeof res.data.url !== "string" || !res.data.id) {
     return rroJson({ status: "error", error: "STRIPE_SESSION_CREATE_FAILED" }, 502);
   }

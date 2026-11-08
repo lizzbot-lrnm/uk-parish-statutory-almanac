@@ -3172,7 +3172,6 @@ export default {
             "/api/rro/search",
             "/api/rro/calculate",
             "/api/rro/audit-pdf",
-            "/api/rro/buy-pack",
             "/api/rro/checkout",
             "/api/rro/telemetry",
             "/api/almanac",

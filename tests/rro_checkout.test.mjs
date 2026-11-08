@@ -14,7 +14,9 @@ const FAKE_PEPPER = "unit-test-pepper-" + "not-a-real-secret-000";
 const FAKE_TELEMETRY_TOKEN = "unit-test-telemetry-" + "token-not-real-0000";
 const FAKE_PREVIEW_SECRET = "unit-test-preview-" + "secret-not-real-000000";
 const hmacHex = (k, m) => crypto.createHmac("sha256", k).update(m).digest("hex");
-const PREVIEW_LINK_TOKEN = hmacHex(FAKE_PREVIEW_SECRET, "rro-preview-link-v1");
+const previewLink = (exp = Math.floor(Date.now() / 1000) + 3600, secret = FAKE_PREVIEW_SECRET) =>
+  exp + "." + hmacHex(secret, "rro-preview-link-v2:" + exp);
+const PREVIEW_LINK_TOKEN = previewLink();
 const previewCookie = (exp = Math.floor(Date.now() / 1000) + 3600, secret = FAKE_PREVIEW_SECRET) =>
   "rro_preview=" + exp + "." + hmacHex(secret, "rro-preview-cookie-v1:" + exp);
 const PREVIEW = { Cookie: previewCookie() };
@@ -564,4 +566,87 @@ test("L-R4: /rro is always private, no-store with Vary: Cookie (hidden, preview 
     assert.equal(r.headers.get("Cache-Control"), "private, no-store");
     assert.match(r.headers.get("Vary") || "", /Cookie/);
   }
+});
+
+// ---------------------------------------------------------------- PR #2 review follow-ups
+test("F1: preview link tokens expire — expired, over-24h and legacy static v1 links are refused", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const bad = [
+    previewLink(now - 5),
+    previewLink(now + 86400 * 7),
+    hmacHex(FAKE_PREVIEW_SECRET, "rro-preview-link-v1"),
+    previewLink(now + 3600, "another-preview-secret-xxxxxxxx"),
+    String(now + 3600) + "." + hmacHex(FAKE_PREVIEW_SECRET, "rro-preview-link-v2:" + (now + 7200)),
+  ];
+  for (const tok of bad) {
+    const r = await worker.fetch(getReq("/rro?rro_preview=" + tok), env(), { redirect: "manual" });
+    assert.equal(r.headers.get("X-RRO-CTA"), "hidden", tok);
+    assert.equal(r.headers.get("Set-Cookie"), null, tok);
+  }
+  const ok = await worker.fetch(getReq("/rro?rro_preview=" + previewLink(now + 86000)), env(), { redirect: "manual" });
+  assert.equal(ok.status, 302);
+});
+
+test("F2: /rro/pack/success shows a generic message; the error code goes to logs only", async () => {
+  noStripe();
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(" "));
+  let html;
+  try {
+    const r = await worker.fetch(getReq("/rro/pack/success?session_id=cs_test_UNKNOWNSESSION00003"), env());
+    assert.equal(r.status, 404);
+    html = await r.text();
+  } finally {
+    console.log = orig;
+  }
+  assert.doesNotMatch(html, /SESSION_NOT_FOUND|[A-Z]{3,}_[A-Z_]{3,}/);
+  assert.match(html, /could not verify this purchase right now/);
+  assert.ok(logs.some((l) => l.includes("rro_pack_success_error") && l.includes("SESSION_NOT_FOUND")));
+  assert.ok(logs.every((l) => !l.includes("cs_test_UNKNOWNSESSION00003")));
+});
+
+test("F3: no preview token reaches worker logs on the preview link redirect", async () => {
+  const tok = previewLink();
+  const lines = [];
+  const saved = {};
+  for (const k of ["log", "info", "warn", "error", "debug"]) {
+    saved[k] = console[k];
+    console[k] = (...a) => lines.push(a.map(String).join(" "));
+  }
+  try {
+    const r = await worker.fetch(getReq("/rro?rro_preview=" + tok), env(), { redirect: "manual" });
+    assert.equal(r.status, 302);
+  } finally {
+    for (const k of Object.keys(saved)) console[k] = saved[k];
+  }
+  const hex = tok.split(".")[1];
+  assert.ok(lines.every((l) => !l.includes(hex)));
+});
+
+test("F4: Stripe Idempotency-Key is deterministic per cart and visitor session, so retries do not duplicate", async () => {
+  const keys = [];
+  mockStripe((url, init) => {
+    keys.push(init.headers["Idempotency-Key"]);
+    return jsonResp({ id: "cs_test_SESSION0000000009", url: "https://checkout.stripe.com/c/pay/cs_test_SESSION0000000009" });
+  });
+  const e = env();
+  const body = { region: "Northern", monthly_rent_gbp: 950 };
+  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq({ region: "Northern", monthly_rent_gbp: 951 }), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body, { "CF-Connecting-IP": "198.51.100.9" }), e)).status, 200);
+  assert.equal(keys.length, 4);
+  assert.match(keys[0], /^rro-cs-[0-9a-f]{48}$/);
+  assert.equal(keys[0], keys[1]);
+  assert.notEqual(keys[0], keys[2]);
+  assert.notEqual(keys[0], keys[3]);
+});
+
+test("F5: /api/rro/buy-pack is no longer advertised in available_endpoints (route itself unchanged)", async () => {
+  const r = await worker.fetch(getReq("/api/definitely-not-a-route"), env());
+  const j = await r.json();
+  assert.ok(Array.isArray(j.available_endpoints));
+  assert.ok(!j.available_endpoints.includes("/api/rro/buy-pack"));
+  assert.ok(j.available_endpoints.includes("/api/rro/checkout"));
 });

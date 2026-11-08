@@ -136,7 +136,8 @@ function rroCookie(request, name) {
 }
 
 // T1: in test mode the CTA is only offered to previewers. The preview link carries
-// ?rro_preview=<HMAC-SHA256(RRO_PREVIEW_SECRET, "rro-preview-link-v1")>; a valid link sets an
+// ?rro_preview=<exp>.<HMAC-SHA256(RRO_PREVIEW_SECRET, "rro-preview-link-v2:" + exp)>, where exp is a
+// unix time at most 24h ahead (HMAC-covered, so it cannot be extended); a valid link sets an
 // HttpOnly cookie "<expiry>.<HMAC(secret, 'rro-preview-cookie-v1:' + expiry)>" for 24h.
 // No RRO_PREVIEW_SECRET (or one shorter than 24 chars) => preview never validates (fail closed).
 const RRO_PREVIEW_TTL_SEC = 86400;
@@ -144,8 +145,10 @@ function rroPreviewSecret(env) {
   const s = env && env.RRO_PREVIEW_SECRET;
   return typeof s === "string" && s.length >= 24 ? s : null;
 }
-async function rroPreviewLinkToken(secret) {
-  return rroHmacSha256Hex(secret, "rro-preview-link-v1");
+const RRO_PREVIEW_CLOCK_SKEW_SEC = 300;
+async function rroPreviewLinkToken(secret, nowSec = Date.now() / 1000, ttlSec = RRO_PREVIEW_TTL_SEC) {
+  const exp = Math.floor(nowSec) + Math.min(ttlSec, RRO_PREVIEW_TTL_SEC);
+  return exp + "." + (await rroHmacSha256Hex(secret, "rro-preview-link-v2:" + exp));
 }
 async function rroPreviewCookieFor(secret, nowSec) {
   const exp = Math.floor(nowSec) + RRO_PREVIEW_TTL_SEC;
@@ -159,11 +162,16 @@ async function rroPreviewCookieValid(request, env, nowSec = Date.now() / 1000) {
   if (!m || Number(m[1]) <= nowSec) return false;
   return rroTimingSafeEqualHex(m[2], await rroHmacSha256Hex(secret, "rro-preview-cookie-v1:" + m[1]));
 }
-async function rroPreviewLinkValid(url, env) {
+async function rroPreviewLinkValid(url, env, nowSec = Date.now() / 1000) {
   const secret = rroPreviewSecret(env);
   const given = url && url.searchParams.get(RRO_PREVIEW_COOKIE);
-  if (!secret || !given || !/^[0-9a-f]{64}$/.test(given)) return false;
-  return rroTimingSafeEqualHex(given, await rroPreviewLinkToken(secret));
+  if (!secret || !given) return false;
+  const m = /^(\d{9,11})\.([0-9a-f]{64})$/.exec(given);
+  if (!m) return false;
+  const exp = Number(m[1]);
+  // Expired links, and links claiming more than 24h of life, are refused.
+  if (exp <= nowSec || exp > nowSec + RRO_PREVIEW_TTL_SEC + RRO_PREVIEW_CLOCK_SKEW_SEC) return false;
+  return rroTimingSafeEqualHex(m[2], await rroHmacSha256Hex(secret, "rro-preview-link-v2:" + m[1]));
 }
 
 function rroTimingSafeEqualHex(a, b) {
@@ -235,7 +243,21 @@ function rroOriginAllowed(request) {
   return origin === selfOrigin || origin === RRO_PUBLIC_ORIGIN;
 }
 
-async function rroStripeRequest(env, method, path, form) {
+// Deterministic Stripe Idempotency-Key per cart (the cleaned pack inputs) and visitor session (the
+// daily IP hash plus mode), bucketed to 10 minutes, so a retried or double-submitted checkout reuses
+// one Checkout Session instead of creating duplicates.
+const RRO_IDEMPOTENCY_BUCKET_SEC = 600;
+async function rroCheckoutIdempotencyKey(mode, ipHash, inputs, nowSec = Date.now() / 1000) {
+  const cart = Object.keys(inputs || {})
+    .sort()
+    .map((k) => k + "=" + String(inputs[k]))
+    .join("&");
+  const bucket = Math.floor(nowSec / RRO_IDEMPOTENCY_BUCKET_SEC);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("rro-checkout-v1|" + mode + "|" + ipHash + "|" + cart + "|" + bucket));
+  return "rro-cs-" + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 48);
+}
+
+async function rroStripeRequest(env, method, path, form, idempotencyKey) {
   const headers = {
     Authorization: "Bearer " + env.STRIPE_SECRET_KEY,
     "Stripe-Version": "2024-06-20",
@@ -243,7 +265,7 @@ async function rroStripeRequest(env, method, path, form) {
   let body;
   if (form) {
     headers["Content-Type"] = "application/x-www-form-urlencoded";
-    headers["Idempotency-Key"] = crypto.randomUUID();
+    headers["Idempotency-Key"] = idempotencyKey || crypto.randomUUID();
     body = new URLSearchParams(form).toString();
   }
   let resp;
@@ -298,5 +320,6 @@ export {
   rroVerifyStripeSignature,
   rroCleanInputs,
   rroOriginAllowed,
+  rroCheckoutIdempotencyKey,
   rroStripeRequest,
 };

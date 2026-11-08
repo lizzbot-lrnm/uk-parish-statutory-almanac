@@ -26,6 +26,11 @@ Config, routes, fail-closed behaviour and deploy steps: [`deploy/RRO_STRIPE_CHEC
 ## Running Tests
 
 ```bash
+# Worker + £24 RRO Stripe Checkout (Node 22+, no network: Stripe is mocked, D1 is an in-memory node:sqlite)
+node --test tests/*.mjs
+
+# Python almanac tests
 pytest -v tests/test_parish_almanac.py
-node --test tests/rro_checkout.test.mjs
 ```
+
+The Node suite needs no secrets: it uses fake `sk_test_`/`whsec_` values, a fake preview secret and a fake IP pepper defined in the test file. It covers checkout creation (test-mode label, deterministic Idempotency-Key), the fail-closed live gate, signed and expiring preview links and cookies, the webhook signature and livemode check, D1-first session lookups and rate limits, IP-hash retention, and the generic `/rro/pack/success` error page. Three Python tests currently fail on `main` as well (sibling-module imports); they are not caused by the checkout work.

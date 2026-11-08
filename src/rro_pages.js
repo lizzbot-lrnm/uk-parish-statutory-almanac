@@ -219,7 +219,11 @@ async function rroHandleCheckoutRoutes(request, env, url) {
     const sid = url.searchParams.get("session_id") || "";
     const loaded = await rroLoadPaidSession(env, sid, request);
     if (!loaded.ok) {
-      const msg = loaded.error === "PAYMENT_NOT_COMPLETE" ? "Payment not completed yet. If you just paid, refresh in a few seconds." : "We could not verify this purchase (" + loaded.error + ").";
+      // Internal error codes stay in logs only (no session id, URL or token); the visitor sees generic text.
+      console.log(JSON.stringify({ event: "rro_pack_success_error", error: String(loaded.error || "UNKNOWN"), status: loaded.status }));
+      const msg = loaded.error === "PAYMENT_NOT_COMPLETE"
+        ? "Payment not completed yet. If you just paid, refresh in a few seconds."
+        : "We could not verify this purchase right now. If you have paid, keep your Stripe receipt and try this link again later.";
       return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Appeal Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Appeal Pack</h1><p>' + D.escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: loaded.status, headers: RRO_CHECKOUT_HTML_HEADERS });
     }
     return new Response(rroSuccessPageHtml(sid, loaded.session), { headers: RRO_CHECKOUT_HTML_HEADERS });
