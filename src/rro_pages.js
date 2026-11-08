@@ -10,8 +10,7 @@ import {
   rroJson,
   rroIpPepper,
   rroIpHash,
-  rroPurgeIpHashes,
-  rroRateLimitHit,
+  rroCacheRateLimitHit,
   RRO_PREVIEW_TTL_SEC,
   rroPreviewSecret,
   rroPreviewCookieFor,
@@ -144,23 +143,23 @@ function rroSessionWithinWindow(session) {
   return Date.now() - created * 1000 <= RRO_PACK_DOWNLOAD_DAYS * 86400000;
 }
 
-// T2 / W-M1: order is (1) config + shape checks, (2) per-ip_hash limit (slot reserved first),
-// (3) D1 lookup: a session_id we never created/recorded -> 404 with NO Stripe call,
-// (4) paid-verdict cache (<=10 min), (5) only then GET the session from Stripe.
+// T2 / W-M1: order is (1) session id shape check before anything else, (2) config checks,
+// (3) per-ip_hash fixed-window limit held in caches.default / isolate memory (NO D1 write on this
+// unauthenticated read path), (4) D1 read: a session_id we never created/recorded -> 404 with NO
+// Stripe call, (5) paid-verdict cache (<=10 min), (6) only then GET the session from Stripe.
 async function rroLoadPaidSession(env, sessionId, request) {
+  if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
   const mode = rroStripeMode(env);
   if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroIpPepper(env)) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
   const sessionMode = String(sessionId).startsWith("cs_live_") ? "live" : "test";
   if (sessionMode !== mode.mode) return { ok: false, status: 400, error: "SESSION_MODE_MISMATCH" };
   const db = env.RRO_CHECKOUT_DB;
-  await rroEnsureCheckoutSchema(db);
   const ipHash = request ? await rroIpHash(request, env) : null;
   if (!ipHash) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  // No retention purge on this unauthenticated GET path: it runs from scheduled() and on checkout writes.
-  if (!(await rroRateLimitHit(db, "pack_lookup", ipHash, RRO_LOOKUP_RATE_LIMIT.max_hits, RRO_LOOKUP_RATE_LIMIT.window_minutes))) {
+  if (!(await rroCacheRateLimitHit("pack_lookup", ipHash, RRO_LOOKUP_RATE_LIMIT.max_hits, RRO_LOOKUP_RATE_LIMIT.window_minutes))) {
     return { ok: false, status: 429, error: "RATE_LIMITED" };
   }
+  await rroEnsureCheckoutSchema(db);
   const known = await db
     .prepare("SELECT kind FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2 LIMIT 1")
     .bind(sessionId, sessionMode)
@@ -176,6 +175,8 @@ async function rroLoadPaidSession(env, sessionId, request) {
   const session = res.data;
   if (!rroSessionIsPaidPack(session)) return { ok: false, status: 402, error: "PAYMENT_NOT_COMPLETE" };
   if (session.id !== sessionId) return { ok: false, status: 502, error: "SESSION_LOOKUP_FAILED" };
+  // Stripe's own livemode flag must agree with the key mode (same check as the webhook).
+  if (Boolean(session.livemode) !== (sessionMode === "live")) return { ok: false, status: 502, error: "SESSION_MODE_MISMATCH" };
   if (!rroSessionWithinWindow(session)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
   await rroRecordPaid(db, session);
   const minimal = rroPaidCacheProject(session);
@@ -214,10 +215,13 @@ async function rroHandleCheckoutRoutes(request, env, url) {
   if (p === "/api/rro/checkout") return rroHandleCheckoutCreate(request, env);
   if (p === "/api/rro/stripe-webhook") return rroHandleStripeWebhook(request, env);
   if (p === "/api/rro/telemetry") {
-    if (request.method !== "GET" && request.method !== "HEAD") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "GET" });
+    if (request.method !== "GET" && request.method !== "HEAD") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "GET, HEAD" });
     // T5: full counters/day-7 internals only with a bearer RRO_TELEMETRY_TOKEN (no CORS); public view is minimal.
     if (await rroTelemetryAuthorised(request, env)) return rroJson(await rroBuildTelemetry(env), 200);
     return rroJson(rroPublicTelemetry(env), 200, { "Access-Control-Allow-Origin": "*" });
+  }
+  if ((p === "/rro/pack/success" || p === "/api/rro/pack") && request.method !== "GET" && request.method !== "HEAD") {
+    return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "GET, HEAD" });
   }
   if (p === "/rro/pack/success") {
     const sid = url.searchParams.get("session_id") || "";

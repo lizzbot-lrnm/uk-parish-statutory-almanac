@@ -1,15 +1,19 @@
 // Emits a Cloudflare-API `execute` async function that deploys worker.js and its src/rro_*.js modules to
 // parish-statutory-almanac with the RRO_CHECKOUT_DB D1 binding. Existing non-secret bindings are read from the
 // script's current settings and preserved; secrets are kept via keep_bindings. Every API response is checked.
+// Registers the mandatory hourly retention cron and fails the deploy if it is not registered afterwards.
 // Contains no secrets.
 import { readFileSync } from "node:fs";
 const MODULES = ["worker.js", "src/rro_core.js", "src/rro_checkout.js", "src/rro_pages.js"];
 const files = Object.fromEntries(MODULES.map((m) => [m, readFileSync(new URL("../" + m, import.meta.url), "utf8")]));
 const message = process.argv[2] || "rro stripe checkout";
+// Equivalent of wrangler's [triggers] crons = ["0 * * * *"]: hourly retention purge via scheduled().
+export const RETENTION_CRON = "0 * * * *";
 process.stdout.write(`async () => {
   const files = ${JSON.stringify(files)};
   const SCRIPT = "parish-statutory-almanac";
   const DB_NAME = "parish-rro-checkout";
+  const RETENTION_CRON = ${JSON.stringify(RETENTION_CRON)};
   const ok = (r, what) => {
     if (!r || r.success !== true) throw new Error(what + " failed: " + JSON.stringify((r && r.errors) || r));
     return r.result;
@@ -35,6 +39,15 @@ process.stdout.write(`async () => {
     form.append(name, new Blob([code], { type: "application/javascript+module" }), name);
   }
   const up = ok(await cloudflare.request({ method: "PUT", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}\`, body: form }), "upload");
-  return { d1: db.uuid, kept_bindings: existing.map((b) => b.type + ":" + b.name), etag: up && up.etag, modified_on: up && up.modified_on };
+  // Retention cron is mandatory (T3): keep any existing schedules, ensure the hourly purge, then read it back.
+  const SCHEDULES = \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/schedules\`;
+  const before = ok(await cloudflare.request({ method: "GET", path: SCHEDULES }), "read schedules");
+  const crons = ((before && before.schedules) || []).map((s) => s.cron).filter(Boolean);
+  if (!crons.includes(RETENTION_CRON)) crons.push(RETENTION_CRON);
+  ok(await cloudflare.request({ method: "PUT", path: SCHEDULES, body: crons.map((cron) => ({ cron })) }), "set schedules");
+  const after = ok(await cloudflare.request({ method: "GET", path: SCHEDULES }), "verify schedules");
+  const registered = ((after && after.schedules) || []).map((s) => s.cron);
+  if (!registered.includes(RETENTION_CRON)) throw new Error("smoke: retention cron " + RETENTION_CRON + " is not registered (got " + JSON.stringify(registered) + ")");
+  return { d1: db.uuid, kept_bindings: existing.map((b) => b.type + ":" + b.name), etag: up && up.etag, modified_on: up && up.modified_on, crons: registered };
 }
 `);

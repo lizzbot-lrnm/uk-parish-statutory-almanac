@@ -48,7 +48,12 @@ const RRO_CHECKOUT_SCHEMA = [
   "CREATE TABLE IF NOT EXISTS rro_rate_hits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, ip_hash TEXT NOT NULL, created_at_utc TEXT NOT NULL)",
   "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits ON rro_rate_hits(bucket, ip_hash, created_at_utc)",
 ];
-const RRO_CHECKOUT_SCHEMA_READY = new WeakSet();
+// One DDL batch per isolate: a module-level promise (a D1 binding wrapper is not a stable WeakSet key).
+// A failed batch clears the promise so the next request retries.
+let RRO_CHECKOUT_SCHEMA_PROMISE = null;
+// caches.default keys live under one namespaced internal prefix that no public route serves.
+const RRO_INTERNAL_CACHE_PREFIX = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/";
+const RRO_OPPORTUNISTIC_PURGE_LIMIT = 500;
 
 function rroStripeMode(env) {
   const key = String((env && env.STRIPE_SECRET_KEY) || "");
@@ -62,10 +67,97 @@ function rroStripeMode(env) {
   return { ok: false, mode: "unconfigured", reason: "STRIPE_SECRET_KEY_UNRECOGNISED_PREFIX" };
 }
 
-async function rroEnsureCheckoutSchema(db) {
-  if (RRO_CHECKOUT_SCHEMA_READY.has(db)) return;
-  await db.batch(RRO_CHECKOUT_SCHEMA.map((sql) => db.prepare(sql)));
-  RRO_CHECKOUT_SCHEMA_READY.add(db);
+function rroEnsureCheckoutSchema(db) {
+  if (!RRO_CHECKOUT_SCHEMA_PROMISE) {
+    RRO_CHECKOUT_SCHEMA_PROMISE = Promise.resolve()
+      .then(() => db.batch(RRO_CHECKOUT_SCHEMA.map((sql) => db.prepare(sql))))
+      .then(() => undefined)
+      .catch((err) => {
+        RRO_CHECKOUT_SCHEMA_PROMISE = null;
+        throw err;
+      });
+  }
+  return RRO_CHECKOUT_SCHEMA_PROMISE;
+}
+
+// Per-isolate fixed-window counters for read-only lookups. No D1 writes: the count lives in this
+// isolate's Map and in caches.default (per colo) under the internal prefix; the higher of the two wins.
+// Not globally exact across isolates/colos by design. It bounds Stripe lookups, not storage.
+const RRO_LOOKUP_LIMITER = new Map();
+const RRO_LOOKUP_LIMITER_MAX_KEYS = 5000;
+// Per-key in-flight chain: checks for one key run one after another inside an isolate, and the count is
+// re-read after the cache await, so concurrent requests cannot all pass on the same pre-await count.
+const RRO_LOOKUP_INFLIGHT = new Map();
+function rroCacheRateLimitHit(bucket, ipHash, max, windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const windowMs = windowMinutes * 60000;
+  const windowIdx = Math.floor(now / windowMs);
+  const key = RRO_INTERNAL_CACHE_PREFIX + "rl/" + encodeURIComponent(bucket) + "/" + encodeURIComponent(ipHash) + "/" + windowIdx;
+  const prev = RRO_LOOKUP_INFLIGHT.get(key) || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => rroCacheRateLimitStep(key, max, windowIdx, windowMs, now));
+  RRO_LOOKUP_INFLIGHT.set(key, run);
+  run.finally(() => { if (RRO_LOOKUP_INFLIGHT.get(key) === run) RRO_LOOKUP_INFLIGHT.delete(key); }).catch(() => {});
+  return run;
+}
+
+async function rroCacheRateLimitStep(key, max, windowIdx, windowMs, now) {
+  for (const [k, v] of RRO_LOOKUP_LIMITER) {
+    if (v.exp > now && RRO_LOOKUP_LIMITER.size < RRO_LOOKUP_LIMITER_MAX_KEYS) break;
+    RRO_LOOKUP_LIMITER.delete(k);
+  }
+  const cache = typeof caches !== "undefined" && caches && caches.default ? caches.default : null;
+  let shared = 0;
+  if (cache) {
+    try {
+      const hit = await cache.match(key);
+      if (hit) shared = Number(await hit.text()) || 0;
+    } catch (_) {}
+  }
+  // Re-read the isolate counter after the await.
+  const local = RRO_LOOKUP_LIMITER.get(key);
+  const count = Math.max(local && local.exp > now ? local.n : 0, shared);
+  if (count >= max) return false;
+  const exp = (windowIdx + 1) * windowMs;
+  RRO_LOOKUP_LIMITER.set(key, { n: count + 1, exp });
+  if (cache) {
+    try {
+      const ttl = Math.max(1, Math.ceil((exp - now) / 1000));
+      await cache.put(key, new Response(String(count + 1), { headers: { "Cache-Control": "max-age=" + ttl } }));
+    } catch (_) {}
+  }
+  return true;
+}
+
+// Bounded body read: refuses a declared Content-Length over maxBytes, then streams the body and cancels
+// as soon as the running total passes maxBytes, so chunked or header-less requests are bounded too.
+async function rroReadCappedBody(request, maxBytes) {
+  const declared = Number(request.headers.get("Content-Length") || 0);
+  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false };
+  if (!request.body) return { ok: true, text: "" };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch (_) {}
+      return { ok: false };
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const ch of chunks) { buf.set(ch, off); off += ch.byteLength; }
+  return { ok: true, text: new TextDecoder().decode(buf) };
+}
+
+// Test hook: forget per-isolate state (schema promise, lookup counters) between in-process test cases.
+function rroResetIsolateStateForTests() {
+  RRO_CHECKOUT_SCHEMA_PROMISE = null;
+  RRO_LOOKUP_LIMITER.clear();
+  RRO_LOOKUP_INFLIGHT.clear();
 }
 
 function rroJson(body, status, extraHeaders) {
@@ -99,13 +191,27 @@ async function rroIpHash(request, env) {
 }
 
 // T3: retention. ip_hash on event rows is NULLed after 48h; rate-limit hits are deleted after 1h
-// (they are only needed for the 10-minute windows). Runs on write and from the scheduled() handler.
+// (they are only needed for the 10-minute windows). Runs from the mandatory hourly scheduled() cron and on
+// admitted checkout writes; the webhook path runs the bounded variant below.
 async function rroPurgeIpHashes(db, nowMs) {
   const now = typeof nowMs === "number" ? nowMs : Date.now();
   const eventCutoff = new Date(now - RRO_IP_HASH_RETENTION_HOURS * 3600000).toISOString();
   const hitCutoff = new Date(now - 3600000).toISOString();
   await db.prepare("UPDATE rro_checkout_events SET ip_hash = NULL WHERE ip_hash IS NOT NULL AND created_at_utc < ?1").bind(eventCutoff).run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
+}
+
+// Opportunistic retention on the webhook write path: at most `limit` rows per table per call.
+async function rroPurgeIpHashesBounded(db, limit, nowMs) {
+  const n = Math.max(1, Math.min(Number(limit) || RRO_OPPORTUNISTIC_PURGE_LIMIT, RRO_OPPORTUNISTIC_PURGE_LIMIT));
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const eventCutoff = new Date(now - RRO_IP_HASH_RETENTION_HOURS * 3600000).toISOString();
+  const hitCutoff = new Date(now - 3600000).toISOString();
+  await db
+    .prepare("UPDATE rro_checkout_events SET ip_hash = NULL WHERE id IN (SELECT id FROM rro_checkout_events WHERE ip_hash IS NOT NULL AND created_at_utc < ?1 LIMIT ?2)")
+    .bind(eventCutoff, n)
+    .run();
+  await db.prepare("DELETE FROM rro_rate_hits WHERE id IN (SELECT id FROM rro_rate_hits WHERE created_at_utc < ?1 LIMIT ?2)").bind(hitCutoff, n).run();
 }
 
 // Atomic check-and-reserve limiter: ONE conditional INSERT ... SELECT ... WHERE count < max, so two
@@ -318,7 +424,12 @@ export {
   RRO_DAY7_RULE,
   RRO_SESSION_ID_RE,
   RRO_CHECKOUT_SCHEMA,
-  RRO_CHECKOUT_SCHEMA_READY,
+  RRO_INTERNAL_CACHE_PREFIX,
+  RRO_OPPORTUNISTIC_PURGE_LIMIT,
+  rroCacheRateLimitHit,
+  rroReadCappedBody,
+  rroPurgeIpHashesBounded,
+  rroResetIsolateStateForTests,
   rroStripeMode,
   rroEnsureCheckoutSchema,
   rroJson,

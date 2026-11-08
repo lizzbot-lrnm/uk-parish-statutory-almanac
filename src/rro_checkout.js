@@ -10,6 +10,9 @@ import {
   RRO_TEST_MODE_LABEL,
   RRO_DAY7_RULE,
   RRO_SESSION_ID_RE,
+  RRO_INTERNAL_CACHE_PREFIX,
+  RRO_OPPORTUNISTIC_PURGE_LIMIT,
+  rroPurgeIpHashesBounded,
   rroStripeMode,
   rroEnsureCheckoutSchema,
   rroJson,
@@ -25,6 +28,7 @@ import {
   rroCheckoutIdempotencyKey,
   rroBrowserNonce,
   rroStripeRequest,
+  rroReadCappedBody,
 } from "./rro_core.js";
 
 async function rroHandleCheckoutCreate(request, env) {
@@ -45,11 +49,10 @@ async function rroHandleCheckoutCreate(request, env) {
   const isJson = ctype.includes("application/json");
   const isForm = !isJson && ctype.includes("application/x-www-form-urlencoded");
   if (!isJson && !isForm) return rroJson({ status: "error", error: "UNSUPPORTED_CONTENT_TYPE" }, 415);
-  const declaredLen = Number(request.headers.get("Content-Length") || 0);
-  if (Number.isFinite(declaredLen) && declaredLen > 4096) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
+  const body = await rroReadCappedBody(request, 4096);
+  if (!body.ok) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
   try {
-    const text = await request.text();
-    if (text.length > 4096) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
+    const text = body.text;
     if (isJson) raw = text ? JSON.parse(text) : {};
     else raw = Object.fromEntries(new URLSearchParams(text));
   } catch (_) {
@@ -134,12 +137,13 @@ async function rroRecordPaid(db, session) {
 
 async function rroHandleStripeWebhook(request, env) {
   if (request.method !== "POST") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "POST" });
-  if (!env.STRIPE_WEBHOOK_SECRET || !env.RRO_CHECKOUT_DB) return rroJson({ status: "error", error: "WEBHOOK_NOT_CONFIGURED" }, 503);
-  // W-L2: refuse oversize bodies from Content-Length before reading; keep the post-read check too.
-  const declaredLen = Number(request.headers.get("Content-Length") || 0);
-  if (Number.isFinite(declaredLen) && declaredLen > 256 * 1024) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
-  const rawBody = await request.text();
-  if (rawBody.length > 256 * 1024) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
+  // Fail closed: no usable Stripe key (missing, unrecognised or live-blocked), no whsec, or no DB -> 503.
+  const mode = rroStripeMode(env);
+  if (!mode.ok || !env.STRIPE_WEBHOOK_SECRET || !env.RRO_CHECKOUT_DB) return rroJson({ status: "error", error: "WEBHOOK_NOT_CONFIGURED" }, 503);
+  // W-L2: bounded streaming read (declared Content-Length refused first; header-less bodies cut off at 256 KiB).
+  const webhookBody = await rroReadCappedBody(request, 256 * 1024);
+  if (!webhookBody.ok) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
+  const rawBody = webhookBody.text;
   const ver = await rroVerifyStripeSignature(rawBody, request.headers.get("Stripe-Signature"), env.STRIPE_WEBHOOK_SECRET);
   if (!ver.ok) return rroJson({ status: "error", error: "SIGNATURE_VERIFICATION_FAILED" }, 400);
   let event;
@@ -158,11 +162,16 @@ async function rroHandleStripeWebhook(request, env) {
   }
   // Mode consistency: livemode must match the configured key mode and the session id prefix;
   // live events are refused unless the Worker is in (gated) live mode.
-  const expectLive = rroStripeMode(env).mode === "live";
+  const expectLive = mode.mode === "live";
   if (session.livemode !== expectLive || String(session.id).startsWith("cs_live_") !== (session.livemode === true)) {
     return rroJson({ status: "error", error: "MODE_MISMATCH" }, 400);
   }
   const inserted = await rroRecordPaid(env.RRO_CHECKOUT_DB, session);
+  try {
+    await rroPurgeIpHashesBounded(env.RRO_CHECKOUT_DB, RRO_OPPORTUNISTIC_PURGE_LIMIT);
+  } catch (err) {
+    console.log({ event: "rro_webhook_purge_failed", error: String((err && err.message) || err).slice(0, 200) });
+  }
   return rroJson({ status: "ok", recorded: inserted, duplicate: !inserted });
 }
 
@@ -279,8 +288,6 @@ function rroPaidCachePut(sessionId, session) {
   if (RRO_PAID_CACHE.size >= 500) RRO_PAID_CACHE.delete(RRO_PAID_CACHE.keys().next().value);
   RRO_PAID_CACHE.set(sessionId, { at: Date.now(), session });
 }
-// caches.default keys live under one namespaced internal prefix that no public route serves.
-const RRO_INTERNAL_CACHE_PREFIX = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/";
 const RRO_PAID_CACHE_URL = RRO_INTERNAL_CACHE_PREFIX + "paid/";
 async function rroPaidCacheApiGet(sessionId) {
   try {

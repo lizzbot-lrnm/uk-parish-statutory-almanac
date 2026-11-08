@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
 import worker from "../worker.js";
+import { rroResetIsolateStateForTests, rroCacheRateLimitHit } from "../src/rro_core.js";
 
 const ORIGIN = "https://parish.technoplusit.co.uk";
 const FAKE_KEY = "sk_test_" + "FAKEFAKEFAKE0123456789";
@@ -38,6 +39,7 @@ function fakeD1() {
 }
 
 function env(overrides = {}) {
+  rroResetIsolateStateForTests(); // fresh in-memory D1 per test => fresh per-isolate schema/limiter state
   return { STRIPE_SECRET_KEY: FAKE_KEY, STRIPE_WEBHOOK_SECRET: FAKE_WHSEC, RRO_IP_PEPPER: FAKE_PEPPER, RRO_PREVIEW_SECRET: FAKE_PREVIEW_SECRET, RRO_CHECKOUT_DB: fakeD1(), ...overrides };
 }
 
@@ -469,20 +471,52 @@ test("M1: paid cache and pack keep only the minimal session fields — never cus
   assert.doesNotMatch(await again.text(), /pii-test@example\.invalid|PII Person/);
 });
 
-test("M2: over-limit pack lookups are refused with no D1 write, and lookups never run the retention purge", async () => {
+test("M2/G1: pack lookups write nothing to D1 (cache-window limiter), are refused over the limit, and never purge", async () => {
   noStripe();
   const e = env();
   const db = e.RRO_CHECKOUT_DB._db;
   seedStart(e, "cs_test_OLDPURGE000000001");
   db.prepare("UPDATE rro_checkout_events SET created_at_utc = ? WHERE session_id = ?").run(new Date(Date.now() - 49 * 3600000).toISOString(), "cs_test_OLDPURGE000000001");
-  for (let i = 0; i < 30; i++) await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_RLW" + String(i).padStart(17, "0")), e);
-  const hits = () => db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n;
-  assert.equal(hits(), 30);
+  const rows = () => db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='rro_rate_hits'").get().n
+    ? db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n : 0;
+  for (let i = 0; i < 30; i++) assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_RLW" + String(i).padStart(17, "0")), e)).status, 404);
   for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(getReq("/rro/pack/success?session_id=cs_test_RLWOVER00000000001"), e)).status, 429);
-  assert.equal(hits(), 30, "over-limit requests must not insert");
+  assert.equal(rows(), 0, "read paths must not insert rate-limit rows");
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, "seed", "GET lookups must not purge");
   await worker.scheduled({}, e);
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, null);
+});
+
+test("G1b: a malformed session id is refused (400) before config, IP hashing, limiter or D1", async () => {
+  noStripe();
+  const touched = [];
+  const e = { RRO_CHECKOUT_DB: { prepare: (sql) => { touched.push(sql); throw new Error("no D1"); }, batch: async () => { touched.push("batch"); } } };
+  for (const sid of ["", "cs_test_short", "cs_prod_abcdefghijkl", "cs_test_" + "a".repeat(241), "cs_test_abc$%^&*()_+1234", "x".repeat(5000)]) {
+    const r = await worker.fetch(getReq("/api/rro/pack?session_id=" + encodeURIComponent(sid)), e);
+    assert.equal(r.status, 400, sid.slice(0, 30));
+  }
+  assert.deepEqual(touched, []);
+});
+
+test("G2: the lookup limiter uses fixed windows in caches.default under the internal prefix (shared across isolates)", async () => {
+  noStripe();
+  const store = new Map();
+  globalThis.caches = { default: {
+    match: async (k) => (store.has(String(k)) ? new Response(store.get(String(k))) : undefined),
+    put: async (k, r) => { store.set(String(k), await r.text()); },
+  } };
+  try {
+    const e = env();
+    for (let i = 0; i < 30; i++) await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_CW" + String(i).padStart(18, "0")), e);
+    const keys = [...store.keys()].filter((k) => k.includes("/rl/"));
+    assert.equal(keys.length, 1);
+    assert.match(keys[0], /^https:\/\/parish\.technoplusit\.co\.uk\/__rro_internal_cache\/v1\/rl\/pack_lookup\/[0-9a-f]{32}\/\d+$/);
+    assert.equal(store.get(keys[0]), "30");
+    rroResetIsolateStateForTests(); // a different isolate: empty Map, same colo cache
+    assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_CWOVER000000000001"), e)).status, 429);
+  } finally {
+    delete globalThis.caches;
+  }
 });
 
 test("M4: Stripe network error -> 502 JSON; oversize Content-Length -> 413 before read; unsupported type -> 415", async () => {
@@ -714,7 +748,7 @@ test("F11: caches.default keys share one namespaced internal prefix that no publ
   assert.equal(RRO_INTERNAL_CACHE_PREFIX, "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/");
   assert.ok(RRO_PAID_CACHE_URL.startsWith(RRO_INTERNAL_CACHE_PREFIX));
   const fs = await import("node:fs");
-  const src = fs.readFileSync(new URL("../worker.js", import.meta.url), "utf8") + fs.readFileSync(new URL("../src/rro_checkout.js", import.meta.url), "utf8");
+  const src = ["../worker.js", "../src/rro_checkout.js", "../src/rro_core.js", "../src/rro_pages.js"].map((f) => fs.readFileSync(new URL(f, import.meta.url), "utf8")).join("\n");
   const keys = [...src.matchAll(/"(https:\/\/parish\.technoplusit\.co\.uk\/__[^"]*)"/g)].map((m) => m[1]);
   assert.ok(keys.length >= 2);
   for (const k of keys) assert.ok(k.startsWith(RRO_INTERNAL_CACHE_PREFIX), k);
@@ -728,4 +762,203 @@ test("F5: /api/rro/buy-pack is no longer advertised in available_endpoints (rout
   assert.ok(Array.isArray(j.available_endpoints));
   assert.ok(!j.available_endpoints.includes("/api/rro/buy-pack"));
   assert.ok(j.available_endpoints.includes("/api/rro/checkout"));
+});
+
+test("G3: the webhook purges retention opportunistically, bounded to 500 rows per table", async () => {
+  const e = env();
+  const db = e.RRO_CHECKOUT_DB._db;
+  await worker.fetch(webhookReq({ type: "checkout.session.completed", data: { object: paidSession("cs_test_PURGEWARM0000001") } }), e);
+  const old = new Date(Date.now() - 49 * 3600000).toISOString();
+  const oldHit = new Date(Date.now() - 2 * 3600000).toISOString();
+  const ins = db.prepare("INSERT INTO rro_checkout_events (kind, stripe_mode, session_id, ip_hash, amount_total, currency, created_at_utc) VALUES ('checkout_start','test',?, 'h', 2400, 'gbp', ?)");
+  const hit = db.prepare("INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) VALUES ('checkout','h',?)");
+  for (let i = 0; i < 600; i++) { ins.run("cs_test_OLD" + String(i).padStart(17, "0"), old); hit.run(oldHit); }
+  const r = await worker.fetch(webhookReq({ type: "checkout.session.completed", data: { object: paidSession("cs_test_PURGEBOUND000001") } }), e);
+  assert.equal((await r.json()).recorded, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events WHERE ip_hash IS NOT NULL AND created_at_utc < ?").get(new Date(Date.now() - 48 * 3600000).toISOString()).n, 100);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n, 100);
+  await worker.scheduled({}, e);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n, 0);
+});
+
+test("G4: the deploy build registers the mandatory hourly cron, keeps existing ones, and fails if it is not registered", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const src = execFileSync(process.execPath, [new URL("../deploy/build_cf_execute.mjs", import.meta.url).pathname, "test"], { encoding: "utf8" });
+  const run = (verifyDrops) => {
+    let schedules = [{ cron: "30 2 * * *" }];
+    const calls = [];
+    const cloudflare = { request: async ({ method, path, body }) => {
+      calls.push(method + " " + path);
+      if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
+      if (path.endsWith("/settings")) return { success: true, result: { bindings: [] } };
+      if (path.endsWith("/schedules") && method === "PUT") { schedules = verifyDrops ? [] : body; return { success: true, result: { schedules } }; }
+      if (path.endsWith("/schedules")) return { success: true, result: { schedules } };
+      return { success: true, result: { etag: "e" } };
+    } };
+    const fn = new Function("cloudflare", "accountId", "FormData", "Blob", "return (" + src + ")")(cloudflare, "acct", FormData, Blob);
+    return fn().then((out) => ({ out, calls, schedules }));
+  };
+  const { out, calls, schedules } = await run(false);
+  assert.deepEqual(schedules.map((s) => s.cron).sort(), ["0 * * * *", "30 2 * * *"]);
+  assert.ok(out.crons.includes("0 * * * *"));
+  assert.ok(calls.indexOf("PUT /accounts/acct/workers/scripts/parish-statutory-almanac/schedules") > calls.indexOf("PUT /accounts/acct/workers/scripts/parish-statutory-almanac"));
+  assert.equal(calls.filter((c) => c === "GET /accounts/acct/workers/scripts/parish-statutory-almanac/schedules").length, 2, "read back after PUT");
+  await assert.rejects(run(true), /retention cron 0 \* \* \* \* is not registered/);
+});
+
+const INTERNAL_WORDING = [/ephemeral/i, /finally:/i, /isolation_context_id/, /zero_retention_verified/, /ephemeral_wiped/, /public_db_mode/, /Read-Only Isolation/, /stateless/i];
+test("G5: /rro and /api/rro-audit-pdf show plain user-facing wording, no internal isolation terms or field names", async () => {
+  const page = await (await worker.fetch(getReq("/rro"), env())).text();
+  for (const re of INTERNAL_WORDING) assert.ok(!re.test(page), "page contains " + re);
+  assert.match(page, /Private RRO Claim Check/);
+  const r = await worker.fetch(new Request(ORIGIN + "/api/rro-audit-pdf", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ claim_text: "Unlicensed HMO s.72(1) Ealing London. Total rent claimed £18,000." }) }), env());
+  assert.equal(r.status, 200);
+  const raw = await r.text();
+  for (const re of INTERNAL_WORDING) assert.ok(!re.test(raw), "audit output contains " + re);
+  const j = JSON.parse(raw);
+  assert.equal(j.privacy_note, "Your text is used only to produce this response and is not stored.");
+  assert.ok(j.private_claim_summary);
+});
+
+test("G6: the webhook fails closed (503, nothing written) without a usable Stripe key or webhook secret", async () => {
+  const ev = { type: "checkout.session.completed", data: { object: paidSession("cs_test_NOKEY00000000001") } };
+  for (const over of [{ STRIPE_SECRET_KEY: "" }, { STRIPE_SECRET_KEY: undefined }, { STRIPE_SECRET_KEY: "sk_bogus_123" }, { STRIPE_SECRET_KEY: FAKE_LIVE_KEY }, { STRIPE_WEBHOOK_SECRET: "" }]) {
+    const e = env(over);
+    const r = await worker.fetch(webhookReq(ev), e);
+    assert.equal(r.status, 503, JSON.stringify(Object.keys(over)));
+    assert.equal((await r.json()).error, "WEBHOOK_NOT_CONFIGURED");
+    const t = e.RRO_CHECKOUT_DB._db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='rro_checkout_events'").get().n;
+    if (t) assert.equal(e.RRO_CHECKOUT_DB._db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events").get().n, 0);
+  }
+});
+
+test("G7: public POST bodies over 64 KB get 413 (declared Content-Length or streamed) on audit-pdf, apify-mcp-lint and /mcp", async () => {
+  const big = "x".repeat(64 * 1024 + 1);
+  for (const path of ["/api/rro-audit-pdf", "/api/apify-mcp-lint", "/mcp"]) {
+    const streamed = await worker.fetch(new Request(ORIGIN + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: big }), env());
+    assert.equal(streamed.status, 413, path + " streamed");
+    const declared = await worker.fetch(new Request(ORIGIN + path, { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": String(1 << 20) }, body: "{}" }), env());
+    assert.equal(declared.status, 413, path + " declared");
+  }
+  const ok = await worker.fetch(new Request(ORIGIN + "/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) }), env());
+  assert.equal(ok.status, 200);
+});
+
+test("G8: checkout DDL runs once per isolate even when each request gets a fresh D1 binding wrapper", async () => {
+  const e = env();
+  let batches = 0;
+  const wrap = () => ({ prepare: (sql) => e.RRO_CHECKOUT_DB.prepare(sql), batch: async (s) => { batches++; return e.RRO_CHECKOUT_DB.batch(s); } });
+  for (let i = 0; i < 4; i++) {
+    await worker.fetch(webhookReq({ type: "checkout.session.completed", data: { object: paidSession("cs_test_DDLONCE" + String(i).padStart(10, "0")) } }), { ...e, RRO_CHECKOUT_DB: wrap() });
+  }
+  assert.equal(batches, 1);
+  // A failed batch is not cached: the next request retries it.
+  rroResetIsolateStateForTests();
+  let fails = 1;
+  const flaky = { prepare: (sql) => e.RRO_CHECKOUT_DB.prepare(sql), batch: async (s) => { if (fails-- > 0) throw new Error("transient"); batches++; return e.RRO_CHECKOUT_DB.batch(s); } };
+  const ev = { type: "checkout.session.completed", data: { object: paidSession("cs_test_DDLRETRY000000001") } };
+  await assert.rejects(worker.fetch(webhookReq(ev), { ...e, RRO_CHECKOUT_DB: flaky }));
+  assert.equal((await worker.fetch(webhookReq(ev), { ...e, RRO_CHECKOUT_DB: flaky })).status, 200);
+});
+
+test("G9: /api/rro/stats needs RRO_TELEMETRY_TOKEN, and the /rro page no longer fetches it", async () => {
+  for (const p of ["/api/rro/stats", "/rro/stats", "/api/rro-stats"]) {
+    assert.equal((await worker.fetch(getReq(p), env())).status, 401, p);
+    assert.equal((await worker.fetch(getReq(p, { Authorization: "Bearer wrong" }), { ...env(), RRO_TELEMETRY_TOKEN: FAKE_TELEMETRY_TOKEN })).status, 401, p);
+  }
+  const good = await worker.fetch(getReq("/api/rro/stats", { Authorization: "Bearer " + FAKE_TELEMETRY_TOKEN }), { ...env(), RRO_TELEMETRY_TOKEN: FAKE_TELEMETRY_TOKEN });
+  assert.equal(good.status, 200);
+  assert.equal((await good.json()).status, "ok");
+  const page = await (await worker.fetch(getReq("/rro"), env())).text();
+  assert.ok(!page.includes('fetch("/api/rro/stats")'));
+  assert.ok(!page.includes('href="/rro/stats"'));
+  const sitemap = await (await worker.fetch(getReq("/sitemap.xml"), env())).text();
+  assert.ok(!sitemap.includes("/rro/stats"));
+  assert.ok(sitemap.includes("<loc>https://parish.technoplusit.co.uk/rro</loc>"));
+});
+
+// A body stream with no Content-Length that records how much was pulled before the worker stopped reading.
+function lazyBody(totalBytes, chunk = 1024) {
+  const state = { pulled: 0, cancelled: false };
+  const stream = new ReadableStream({
+    pull(ctrl) {
+      if (state.pulled >= totalBytes) return ctrl.close();
+      state.pulled += chunk;
+      ctrl.enqueue(new Uint8Array(chunk).fill(120));
+    },
+    cancel() { state.cancelled = true; },
+  });
+  return { stream, state };
+}
+
+test("G10: concurrent lookups in one isolate cannot all pass on the same pre-await count (serialised per key)", async () => {
+  const store = new Map();
+  const delay = () => new Promise((r) => setTimeout(r, 2));
+  globalThis.caches = { default: {
+    match: async (k) => { await delay(); return store.has(String(k)) ? new Response(store.get(String(k))) : undefined; },
+    put: async (k, r) => { await delay(); store.set(String(k), await r.text()); },
+  } };
+  try {
+    rroResetIsolateStateForTests();
+    const now = Date.now();
+    const results = await Promise.all(Array.from({ length: 12 }, () => rroCacheRateLimitHit("pack_lookup", "a".repeat(32), 5, 10, now)));
+    assert.equal(results.filter(Boolean).length, 5);
+    // Through the route too: 40 parallel lookups from one IP, at most 30 are admitted.
+    noStripe();
+    const e = env();
+    const res = await Promise.all(Array.from({ length: 40 }, (_, i) => worker.fetch(getReq("/api/rro/pack?session_id=cs_test_PAR" + String(i).padStart(17, "0")), e)));
+    assert.equal(res.filter((r) => r.status === 429).length, 10);
+  } finally {
+    delete globalThis.caches;
+  }
+  // Without caches.default the isolate counter alone still serialises.
+  rroResetIsolateStateForTests();
+  const now2 = Date.now();
+  const r2 = await Promise.all(Array.from({ length: 9 }, () => rroCacheRateLimitHit("pack_lookup", "b".repeat(32), 3, 10, now2)));
+  assert.equal(r2.filter(Boolean).length, 3);
+});
+
+test("G11: checkout, webhook and pdf-clause-extract stop reading a body with no Content-Length at the cap (413)", async () => {
+  noStripe();
+  const cases = [
+    { path: "/api/rro/checkout", cap: 4096, headers: { "Content-Type": "application/json", Origin: ORIGIN, "CF-Connecting-IP": "203.0.113.7", ...PREVIEW } },
+    { path: "/api/rro/stripe-webhook", cap: 256 * 1024, headers: { "Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00" } },
+    { path: "/api/pdf-clause-extract", cap: 64 * 1024, headers: { "Content-Type": "application/json" } },
+  ];
+  for (const c of cases) {
+    const { stream, state } = lazyBody(10 * 1024 * 1024);
+    const req = new Request(ORIGIN + c.path, { method: "POST", headers: c.headers, body: stream, duplex: "half" });
+    assert.equal(req.headers.get("Content-Length"), null);
+    const r = await worker.fetch(req, env());
+    assert.equal(r.status, 413, c.path);
+    assert.ok(state.pulled <= c.cap + 8 * 1024, c.path + " read " + state.pulled + " bytes");
+    assert.ok(state.cancelled, c.path + " stream cancelled");
+  }
+  // Small bodies still work.
+  const ok = await worker.fetch(new Request(ORIGIN + "/api/pdf-clause-extract", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ raw_text: "The tenant shall pay rent monthly." }) }), env());
+  assert.notEqual(ok.status, 413);
+});
+
+test("G12: pack lookup rejects a Stripe session whose livemode disagrees with the key mode, and records nothing", async () => {
+  const sid = "cs_test_LIVEFLAG0000000001";
+  mockStripe((url) => (url.includes("/v1/checkout/sessions/") ? jsonResp(paidSession(sid, { livemode: true })) : jsonResp({}, 404)));
+  const e = env();
+  seedStart(e, sid);
+  const r = await worker.fetch(getReq("/api/rro/pack?session_id=" + sid), e);
+  assert.equal(r.status, 502);
+  assert.equal((await r.json()).error, "SESSION_MODE_MISMATCH");
+  const paid = e.RRO_CHECKOUT_DB._db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events WHERE kind = 'paid'").get();
+  assert.equal(Number(paid.n), 0);
+  // The matching flag still works.
+  mockStripe((url) => (url.includes("/v1/checkout/sessions/") ? jsonResp(paidSession(sid)) : jsonResp({}, 404)));
+  assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=" + sid), e)).status, 200);
+});
+
+test("G13: pack, success and telemetry answer other methods with 405 and Allow: GET, HEAD", async () => {
+  noStripe();
+  for (const [path, method] of [["/api/rro/pack?session_id=cs_test_METHOD000000000001", "POST"], ["/rro/pack/success?session_id=cs_test_METHOD000000000001", "PUT"], ["/api/rro/telemetry", "DELETE"]]) {
+    const r = await worker.fetch(new Request(ORIGIN + path, { method, headers: { "CF-Connecting-IP": "203.0.113.7" } }), env());
+    assert.equal(r.status, 405, path);
+    assert.equal(r.headers.get("Allow"), "GET, HEAD", path);
+  }
 });

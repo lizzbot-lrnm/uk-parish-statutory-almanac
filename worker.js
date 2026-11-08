@@ -13,7 +13,19 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
-import { rroEnsureCheckoutSchema, rroPurgeIpHashes } from "./src/rro_core.js";
+import { rroEnsureCheckoutSchema, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
+import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
+
+// Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
+// with the bounded streaming read in src/rro_core.js (a missing or lying Content-Length cannot bypass it).
+const PUBLIC_POST_BODY_MAX_BYTES = 64 * 1024;
+const readCappedBody = (request, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) => rroReadCappedBody(request, maxBytes);
+function payloadTooLarge(corsHeaders) {
+  return Response.json(
+    { status: "error", error: "PAYLOAD_TOO_LARGE", max_bytes: PUBLIC_POST_BODY_MAX_BYTES },
+    { status: 413, headers: { ...(corsHeaders || {}), "Cache-Control": "no-store" } }
+  );
+}
 import { rroHandleCheckoutRoutes, rroRenderRroPage, setRroDeps } from "./src/rro_pages.js";
 
 const GOV_UK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json";
@@ -952,7 +964,7 @@ const LLMS_TXT = `# UK Parish Council, Village Hall, Charity & Payroll Statutory
 - GET /rro (Interactive UK Property Tribunal Rent Repayment Order & Section 13 Precedent Finder UI)
 - GET /api/rro/search?borough=Camden&region=London (also aliased at /api/rro-search)
 - GET /api/rro-search?format=csv (Download Regional RRO Precedent Pack CSV)
-- POST /api/rro-audit-pdf (Stateless ephemeral private RRO claim/PDF exposure auditor)
+- POST /api/rro-audit-pdf (Private RRO claim check: compares your draft claim with published tribunal decisions; your text is not stored)
 - GET /api/almanac?year=2026&postcode=OX14+4AB&meeting=2026-11-16&domain=gov.uk&electors=1200&seats=11&elected=8&cilca=true&spend=4500&charity_income=35000&charity_assets=150000
 - GET /api/three-clear-days?meeting=2026-11-16
 - GET /api/s137-gpc?electors=1200&seats=11&elected=6&cilca=false&spend=8500&fy=2026/27
@@ -1047,7 +1059,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   <main class="container">
     <div class="callout" style="background:#eff6ff;border-left:4px solid #1d4ed8;">
       <strong>NEW NORTH STAR LIVE — <a href="/rro" style="color:#1d4ed8;font-weight:700;">UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder (/rro) &rarr;</a></strong><br/>
-      Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>stateless zero-retention private PDF/claim audit</strong>, or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
+      Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>private claim check</strong> (your text is not stored), or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
     </div>
     <div class="callout">
       <strong>3 Live Statutory &amp; Technical Traps Caught Here:</strong><br/>
@@ -1657,7 +1669,6 @@ function minNum(a, b) {
 }
 
 function auditPrivateRroClaimEdge(payload = {}) {
-  const isolationContextId = crypto.randomUUID();
   let ephemeralBuffer = String(payload.claim_text || payload.raw_text || payload.text || "");
   try {
     const normalized = ephemeralBuffer
@@ -1735,11 +1746,8 @@ function auditPrivateRroClaimEdge(payload = {}) {
 
     return {
       status: "ok",
-      isolation_mode: "stateless-ephemeral-finally-wiped",
-      public_db_mode: "OGL-v3.0-read-only",
-      isolation_context_id: isolationContextId,
-      ephemeral_wiped: true,
-      zero_retention_verified: true,
+      privacy_note: "Your text is used only to produce this response and is not stored.",
+      data_source: "Published GOV.UK First-tier Tribunal (Property Chamber) decisions, Open Government Licence v3.0",
       private_claim_summary: {
         detected_region: region,
         detected_offence_type: offenceType,
@@ -2105,7 +2113,7 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</title>
-  <meta name="description" content="Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Housing Act 2004 s.72/s.95 &amp; Housing and Planning Act 2016 s.40-44. Filter by region, offence, and mitigation factors, or run a zero-retention private claim audit." />
+  <meta name="description" content="Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Housing Act 2004 s.72/s.95 &amp; Housing and Planning Act 2016 s.40-44. Filter by region, offence, and mitigation factors, or check a draft claim privately (your text is not stored)." />
   <style>
     :root { --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #475569; --accent: #0f766e; --border: #e2e8f0; --ok: #15803d; --blue: #1d4ed8; }
     * { box-sizing: border-box; }
@@ -2143,12 +2151,11 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
   <header>
     <div class="container">
       <div class="topnav">
-        <span><strong>TechnoPlusIT UK Statutory Precedent Engine</strong> · OGL v3.0 Read-Only Isolation</span>
+        <span><strong>TechnoPlusIT UK Statutory Precedent Engine</strong> · Source data: GOV.UK, Open Government Licence v3.0</span>
         <div>
           <a href="/">← Back to UK Statutory Almanac</a> &nbsp;|&nbsp;
           <a href="/api/rro-search?format=csv">Download Regional Precedent Pack (CSV)</a> &nbsp;|&nbsp;
-          <a href="/api/rro-search">JSON API</a> &nbsp;|&nbsp;
-          <a href="/rro/stats">Live North Star Stats (Zero-PII)</a>
+          <a href="/api/rro-search">JSON API</a>
         </div>
       </div>
       <h1>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</h1>
@@ -2156,9 +2163,9 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
       <div class="badge-row">
         <span class="badge">281 Real GOV.UK Tribunal PDFs Indexed</span>
         <span class="badge">Read-Only (?mode=ro) OGL v3.0 Reference Index</span>
-        <span class="badge">Stateless Ephemeral Private Claim Auditor (finally: wiped)</span>
+        <span class="badge">Private claim check (text not stored)</span>
         <span class="badge">0 LLM Tokens · Deterministic PDF Ligature Recovery</span>
-        <a href="/rro/stats" class="badge" id="northStarBadge" style="text-decoration:none;background:#0d9488;color:#fff;font-weight:700;">7-Day North Star Gate: Live Zero-PII Stats ↗</a>
+        <span class="badge" id="northStarBadge" style="background:#0d9488;color:#fff;font-weight:700;">Free precedent search</span>
       </div>
     </div>
   </header>
@@ -2305,14 +2312,14 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>2. Stateless Ephemeral Private RRO Claim / PDF Exposure Auditor (Zero Retention)</h2>
+      <h2>2. Private RRO Claim Check</h2>
       <p style="font-size:0.88rem;color:#475569;margin-top:0;">
-        Paste a draft RRO claim, statement of case, or extracted PDF text below. Processed strictly in an isolated per-request ephemeral buffer and deterministically wiped in a <code>finally:</code> block (<code>ephemeral_wiped: true</code>) against the read-only OGL v3.0 precedent index.
+        Paste a draft RRO claim, statement of case, or text copied from a PDF below. We compare it with published tribunal decisions and show comparable awards. Your text is used only to produce the result and is not stored.
       </p>
-      <label for="privateText">Private RRO Claim / Statement of Case Text (Wiped Immediately After Response)</label>
+      <label for="privateText">Your draft claim or statement of case (not stored)</label>
       <textarea id="privateText">Case Reference: Draft Claim (Ealing London W3). Application for a Rent Repayment Order under section 95(1) Housing Act 2004 (Selective Licensing) and section 72(1) HMO. Total rent paid and claimed for 12 months is £21,000.00 inclusive of utilities and council tax. The landlord relied upon a managing agent, had no previous convictions, and applied for a licence once notified.</textarea>
       <div class="btn-row">
-        <button id="auditBtn" type="button">Run Stateless Ephemeral RRO Exposure Audit</button>
+        <button id="auditBtn" type="button">Check my claim</button>
       </div>
       <pre id="auditOutput">Click above to benchmark private claim exposure against read-only OGL v3.0 rulings...</pre>
     </div>
@@ -2384,16 +2391,8 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
     document.getElementById("region").addEventListener("change", runRroSearch);
     document.getElementById("offence").addEventListener("change", runRroSearch);
     document.getElementById("mitigation").addEventListener("change", runRroSearch);
-    async function refreshNorthStarBadge() {
-      try {
-        const r = await fetch("/api/rro/stats");
-        const s = await r.json();
-        const el = document.getElementById("northStarBadge");
-        if (el && s && s.status === "ok") {
-          el.textContent = "7-Day North Star Gate: " + s.total_searches + "/100 Searches · " + s.total_pack_downloads + "/10 Pack Downloads · " + s.total_private_audits + " Audits (Zero-PII JSON ↗)";
-        }
-      } catch (_) {}
-    }
+    // Usage counters are private (/api/rro/stats needs RRO_TELEMETRY_TOKEN), so the page shows no live counts.
+    async function refreshNorthStarBadge() {}
 
     async function runRroCalc() {
       const monthly_rent_gbp = document.getElementById("calcRent").value;
@@ -2506,7 +2505,7 @@ const MCP_TOOLS_MANIFEST = [
   },
   {
     name: "audit_private_rro_claim",
-    description: "Stateless ephemeral audit of an RRO application or decision excerpt against the 281-decision GOV.UK tribunal corpus.",
+    description: "Check an RRO application or decision excerpt against the 281 published GOV.UK tribunal decisions. Input text is not stored.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2652,6 +2651,9 @@ async function handleMcpRpcMessage(msg, isInternal) {
 
 // RRO £24 Stripe Checkout lives in src/rro_core.js, src/rro_checkout.js and src/rro_pages.js.
 
+// /rro/stats is token-gated, so it is not advertised in the public sitemap.
+const RRO_PUBLIC_SITEMAP_XML = RRO_SITEMAP_XML.replace(/\s*<url>\s*<loc>https:\/\/parish\.technoplusit\.co\.uk\/rro\/stats<\/loc>[\s\S]*?<\/url>/, "");
+
 export default {
   async fetch(request, env = {}, ctx) {
     const url = new URL(request.url);
@@ -2705,9 +2707,11 @@ export default {
         );
       }
       if (request.method === "POST") {
+        const mcpBody = await readCappedBody(request);
+        if (!mcpBody.ok) return payloadTooLarge(corsHeaders);
         let payload;
         try {
-          payload = await request.json();
+          payload = JSON.parse(mcpBody.text);
         } catch (_) {
           return Response.json(
             { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error: invalid JSON" } },
@@ -2727,7 +2731,7 @@ export default {
     }
 
     if (url.pathname === "/sitemap.xml") {
-      return new Response(RRO_SITEMAP_XML, {
+      return new Response(RRO_PUBLIC_SITEMAP_XML, {
         headers: { ...corsHeaders, "Content-Type": "application/xml; charset=utf-8" },
       });
     }
@@ -2759,6 +2763,12 @@ export default {
       url.pathname === "/api/rro/stats/" ||
       url.pathname === "/api/rro-stats"
     ) {
+      if (!(await rroTelemetryAuthorised(request, env))) {
+        return Response.json(
+          { status: "error", error: "UNAUTHORIZED" },
+          { status: 401, headers: { "Cache-Control": "no-store", "WWW-Authenticate": "Bearer", "X-Content-Type-Options": "nosniff" } }
+        );
+      }
       const statsPayload = await getRroEdgeStats();
       return Response.json(statsPayload, {
         headers: {
@@ -2921,7 +2931,9 @@ export default {
         claimed_gbp: url.searchParams.get("claimed_gbp") || "",
       };
       if (request.method === "POST") {
-        const rawBody = await request.text();
+        const capped = await readCappedBody(request);
+        if (!capped.ok) return payloadTooLarge(corsHeaders);
+        const rawBody = capped.text;
         try {
           const parsed = JSON.parse(rawBody);
           payload = { ...payload, ...parsed };
@@ -3058,7 +3070,9 @@ export default {
       let rawText = url.searchParams.get("text") || url.searchParams.get("raw_text") || "";
       let docType = url.searchParams.get("document_type") || "auto";
       if (!rawText && request.method === "POST") {
-        const bodyText = await request.text();
+        const clauseBody = await readCappedBody(request);
+        if (!clauseBody.ok) return payloadTooLarge(corsHeaders);
+        const bodyText = clauseBody.text;
         try {
           const parsed = JSON.parse(bodyText);
           rawText = parsed.raw_text || parsed.text || "";
@@ -3084,7 +3098,9 @@ export default {
       let rawPayload = url.searchParams.get("schema");
       const strategy = url.searchParams.get("strategy") || "move_default_to_prefill";
       if (!rawPayload && request.method === "POST") {
-        rawPayload = await request.text();
+        const capped = await readCappedBody(request);
+        if (!capped.ok) return payloadTooLarge(corsHeaders);
+        rawPayload = capped.text;
       }
       if (!rawPayload) {
         rawPayload = JSON.stringify({
@@ -3168,7 +3184,6 @@ export default {
           available_endpoints: [
             "/mcp",
             "/api/health",
-            "/api/rro/stats",
             "/api/rro/search",
             "/api/rro/calculate",
             "/api/rro/audit-pdf",
@@ -3199,7 +3214,8 @@ export default {
     );
   },
 
-  // T3: optional cron trigger (e.g. hourly) purges ip_hash > 48h. On-write purge runs regardless.
+  // T3: MANDATORY hourly cron ("0 * * * *", registered and verified by deploy/build_cf_execute.mjs) runs the full
+  // retention purge: ip_hash NULLed after 48h, rate-limit rows deleted after 1h. The webhook also purges (bounded).
   async scheduled(_event, env = {}, ctx) {
     if (!env || !env.RRO_CHECKOUT_DB) return;
     const job = (async () => {
