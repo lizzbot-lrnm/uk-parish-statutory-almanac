@@ -12,7 +12,12 @@ const FAKE_LIVE_KEY = "sk_live_" + "FAKE0123456789";
 const FAKE_WHSEC = "whsec_" + "unit_test_only_not_a_real_secret";
 const FAKE_PEPPER = "unit-test-pepper-" + "not-a-real-secret-000";
 const FAKE_TELEMETRY_TOKEN = "unit-test-telemetry-" + "token-not-real-0000";
-const PREVIEW = { Cookie: "rro_preview=1" };
+const FAKE_PREVIEW_SECRET = "unit-test-preview-" + "secret-not-real-000000";
+const hmacHex = (k, m) => crypto.createHmac("sha256", k).update(m).digest("hex");
+const PREVIEW_LINK_TOKEN = hmacHex(FAKE_PREVIEW_SECRET, "rro-preview-link-v1");
+const previewCookie = (exp = Math.floor(Date.now() / 1000) + 3600, secret = FAKE_PREVIEW_SECRET) =>
+  "rro_preview=" + exp + "." + hmacHex(secret, "rro-preview-cookie-v1:" + exp);
+const PREVIEW = { Cookie: previewCookie() };
 
 function fakeD1() {
   const db = new DatabaseSync(":memory:");
@@ -30,7 +35,7 @@ function fakeD1() {
 }
 
 function env(overrides = {}) {
-  return { STRIPE_SECRET_KEY: FAKE_KEY, STRIPE_WEBHOOK_SECRET: FAKE_WHSEC, RRO_IP_PEPPER: FAKE_PEPPER, RRO_CHECKOUT_DB: fakeD1(), ...overrides };
+  return { STRIPE_SECRET_KEY: FAKE_KEY, STRIPE_WEBHOOK_SECRET: FAKE_WHSEC, RRO_IP_PEPPER: FAKE_PEPPER, RRO_PREVIEW_SECRET: FAKE_PREVIEW_SECRET, RRO_CHECKOUT_DB: fakeD1(), ...overrides };
 }
 
 function paidSession(id = "cs_test_a1B2c3D4e5F6g7H8i9J0", extra = {}) {
@@ -386,14 +391,14 @@ test("T1: /rro hides the £24 CTA in test mode without preview, and when unconfi
   }
 });
 
-test("T1: /rro?rro_preview=1 in test mode shows CTA with TEST MODE label and sets HttpOnly preview cookie", async () => {
-  const r = await worker.fetch(getReq("/rro?rro_preview=1"), env());
+test("T1: /rro?rro_preview=<signed token> in test mode shows CTA with TEST MODE label and sets signed HttpOnly preview cookie", async () => {
+  const r = await worker.fetch(getReq("/rro?rro_preview=" + PREVIEW_LINK_TOKEN), env());
   const html = await r.text();
   assert.match(html, /id="formalPackBtn"/);
   assert.match(html, /\[TEST MODE\] Export Formal Tribunal Appeal Pack — £24/);
   assert.match(html, /TEST MODE – no real payment; do not enter real card details/);
   assert.equal(r.headers.get("X-RRO-CTA"), "test_preview");
-  assert.match(r.headers.get("Set-Cookie"), /^rro_preview=1;.*HttpOnly.*SameSite=Strict/);
+  assert.match(r.headers.get("Set-Cookie"), /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Strict/);
   assert.match(r.headers.get("Cache-Control"), /no-store/);
   const viaCookie = await worker.fetch(getReq("/rro", PREVIEW), env());
   assert.match(await viaCookie.text(), /TEST MODE – no real payment/);
@@ -408,4 +413,28 @@ test("/rro in (gated) live mode has the plain £24 CTA, no TEST label; CSP allow
   assert.doesNotMatch(html, /Dossier Pack \(£29\)/);
   assert.equal(r.headers.get("X-RRO-CTA"), "live");
   assert.match(r.headers.get("Content-Security-Policy"), /form-action 'self' https:\/\/checkout\.stripe\.com/);
+});
+
+test("T1: preview is HMAC-signed — unsigned/forged/expired/wrong-key cookies and links get no CTA and no test checkout", async () => {
+  const e = env();
+  for (const bad of ["/rro?rro_preview=1", "/rro?rro_preview=" + "0".repeat(64)]) {
+    const r = await worker.fetch(getReq(bad), e);
+    assert.equal(r.headers.get("X-RRO-CTA"), "hidden", bad);
+    assert.equal(r.headers.get("Set-Cookie"), null, bad);
+  }
+  const past = Math.floor(Date.now() / 1000) - 10;
+  for (const c of ["rro_preview=1", previewCookie(past), previewCookie(undefined, "another-preview-secret-xxxxxxxx")]) {
+    const page = await worker.fetch(getReq("/rro", { Cookie: c }), e);
+    assert.equal(page.headers.get("X-RRO-CTA"), "hidden", c);
+    const r = await worker.fetch(checkoutReq({}, { Cookie: c }), env());
+    assert.equal(r.status, 503, c);
+  }
+});
+
+test("T1: missing RRO_PREVIEW_SECRET fails closed — even a well-formed cookie gives no CTA and no test checkout", async () => {
+  const e = env({ RRO_PREVIEW_SECRET: undefined });
+  const page = await worker.fetch(getReq("/rro?rro_preview=" + PREVIEW_LINK_TOKEN, PREVIEW), e);
+  assert.equal(page.headers.get("X-RRO-CTA"), "hidden");
+  const r = await worker.fetch(checkoutReq(), env({ RRO_PREVIEW_SECRET: undefined }));
+  assert.equal(r.status, 503);
 });

@@ -22,6 +22,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 |---|---|---|
 | `STRIPE_SECRET_KEY` | Worker secret | `sk_test_…`/`rk_test_…` first. A live key is **refused** unless `RRO_STRIPE_LIVE_ENABLED=true`. A restricted key needs Checkout Sessions: write. |
 | `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Checkout fails closed without it. |
+| `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
 | `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Checkout and pack lookups return `503 CHECKOUT_NOT_CONFIGURED` without it. Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
 | `RRO_STRIPE_LIVE_ENABLED` | plain var | Exactly `true` (case-sensitive, no whitespace; T4) **only after the live-mode security review passes and the site owner approves**. `TRUE`, `True`, `1` stay blocked. |
@@ -40,7 +41,7 @@ Missing key / webhook secret / D1 / `RRO_IP_PEPPER`, or live key without the exa
 | Test key, visitor has preview | Amber "[TEST MODE] …" button plus banner **"TEST MODE – no real payment; do not enter real card details."** Stripe Checkout also shows that text above the pay button (`custom_text[submit]`). |
 | Test key, no preview / not configured | **No CTA at all.** Real visitors never reach a Stripe test checkout. |
 
-Preview: open `https://parish.technoplusit.co.uk/rro?rro_preview=1`. That sets an `HttpOnly; Secure; SameSite=Strict` cookie `rro_preview=1` for 24h. `POST /api/rro/checkout` in test mode also requires that cookie (503 without it). Preview responses are `Cache-Control: private, no-store`; header `X-RRO-CTA` reports `live` / `test_preview` / `hidden`.
+Preview (signed, key holder only): the link token is `HMAC-SHA256(RRO_PREVIEW_SECRET, "rro-preview-link-v1")` in hex, computed locally with `printf 'rro-preview-link-v1' | openssl dgst -sha256 -hmac "$RRO_PREVIEW_SECRET"` (never paste the secret or token in chat, notes or logs). Opening `/rro?rro_preview=<token>` sets an `HttpOnly; Secure; SameSite=Strict` cookie `rro_preview=<exp>.<HMAC(secret, "rro-preview-cookie-v1:"+exp)>` valid 24h. Unsigned, forged, expired or wrong-key cookies are ignored, and if `RRO_PREVIEW_SECRET` is missing (or under 24 chars) preview fails closed: no CTA and `POST /api/rro/checkout` in test mode returns 503. Preview responses are `Cache-Control: private, no-store`; header `X-RRO-CTA` reports `live` / `test_preview` / `hidden`.
 
 ## T3: IP hash retention
 `ip_hash = HMAC-SHA256(RRO_IP_PEPPER, YYYY-MM-DD + ":" + CF-Connecting-IP)` truncated to 32 hex. Event-row `ip_hash` is set to NULL after **48h** and rate-limit rows are deleted after 1h. This runs on every checkout/lookup write, and from `scheduled()` if you add a cron trigger (optional, e.g. hourly: Workers → parish-statutory-almanac → Settings → Triggers → Cron).
@@ -49,7 +50,7 @@ Preview: open `https://parish.technoplusit.co.uk/rro?rro_preview=1`. That sets a
 Targets `main` directly; contains only the checkout change.
 
 ## Live gate checklist (not in this pass)
-All must be done, plus a fresh security review, owner approval and a separate live webhook secret, before `RRO_STRIPE_LIVE_ENABLED` is set. Marked `TODO(live-gate L1–L10)` in worker.js.
+All must be done, plus a fresh security review, owner approval and a separate live webhook secret, before `RRO_STRIPE_LIVE_ENABLED` is set. Marked `TODO(live-gate L1–L11)` in worker.js.
 - [ ] L1 Trader identity shown before purchase
 - [ ] L2 Terms of sale and refund policy
 - [ ] L3 Consumer Contracts Regulations reg. 37 digital-content waiver
@@ -60,11 +61,12 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - [ ] L8 Estimate wording review
 - [ ] L9 Remove the legacy £29 intent-validation offer (`/api/rro/buy-pack`)
 - [ ] L10 Day-7 rule counts paid orders only and has a named owner
+- [ ] L11 Add an hourly cron trigger so the 48h `ip_hash` purge runs even with no traffic
 
 ## Deploy
-1. `node deploy/build_cf_execute.mjs > deploy_payload.js` — produces the Cloudflare-API `execute` payload (creates/reuses D1 `parish-rro-checkout`, uploads `worker.js` with the D1 binding and `keep_bindings: ["secret_text"]` so secrets survive redeploys).
-2. Secrets are put by the key holder (`wrangler secret put STRIPE_SECRET_KEY --name parish-statutory-almanac`, same for `STRIPE_WEBHOOK_SECRET`), plus `RRO_IP_PEPPER` (required) and optionally `RRO_TELEMETRY_TOKEN` via the `openssl rand -hex 32 | wrangler secret put …` pattern, or the CF dashboard. Never echo values in chat, notes, logs or commits.
-3. Smoke: `curl https://parish.technoplusit.co.uk/api/rro/telemetry` → `{"status":"ok",…,"mode":"test"}`. `/rro` without preview → no CTA (`X-RRO-CTA: hidden`). `/rro?rro_preview=1` → TEST MODE CTA. From that preview browser, pay with a Stripe test card (4242…), then check `paid` increments via full telemetry (bearer).
+1. `node deploy/build_cf_execute.mjs > deploy_payload.js` — produces the Cloudflare-API `execute` payload (creates/reuses D1 `parish-rro-checkout`, uploads `worker.js` plus the `src/rro_*.js` modules with the D1 binding, merges the script's existing non-secret bindings from its current settings, keeps secrets via `keep_bindings`, and throws on any Cloudflare API response without `success`).
+2. Secrets are put by the key holder (`wrangler secret put STRIPE_SECRET_KEY --name parish-statutory-almanac`, same for `STRIPE_WEBHOOK_SECRET`), plus `RRO_IP_PEPPER` (required), `RRO_PREVIEW_SECRET` (required for preview) and optionally `RRO_TELEMETRY_TOKEN` via the `openssl rand -hex 32 | wrangler secret put …` pattern, or the CF dashboard. Never echo values in chat, notes, logs or commits.
+3. Smoke: `curl https://parish.technoplusit.co.uk/api/rro/telemetry` → `{"status":"ok",…,"mode":"test"}`. `/rro` without preview → no CTA (`X-RRO-CTA: hidden`). `/rro?rro_preview=1` → still hidden (unsigned). `/rro?rro_preview=<signed token>` → TEST MODE CTA. From that preview browser, pay with a Stripe test card (4242…), then check `paid` increments via full telemetry (bearer).
 
 ## Tests
 `node --test tests/rro_checkout.test.mjs` (Node ≥ 22, uses `node:sqlite` as a D1 stand-in; Stripe is mocked).

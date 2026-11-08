@@ -13,6 +13,9 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
+import { rroEnsureCheckoutSchema, rroPurgeIpHashes } from "./src/rro_core.js";
+import { rroHandleCheckoutRoutes, rroRenderRroPage, setRroDeps } from "./src/rro_pages.js";
+
 const GOV_UK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json";
 const POSTCODES_IO_URL = "https://api.postcodes.io/postcodes";
 const CLOUDFLARE_DOH_URL = "https://cloudflare-dns.com/dns-query";
@@ -45,9 +48,14 @@ function isValidIsoDate(s) {
 }
 
 async function fetchBankHolidays(division = "england-and-wales") {
-  const resp = await fetch(GOV_UK_BANK_HOLIDAYS_URL, {
-    headers: { "User-Agent": "ParishStatutoryAlmanac/1.1 (+https://parish.technoplusit.co.uk)" },
-  });
+  let resp;
+  try {
+    resp = await fetch(GOV_UK_BANK_HOLIDAYS_URL, {
+      headers: { "User-Agent": "ParishStatutoryAlmanac/1.1 (+https://parish.technoplusit.co.uk)" },
+    });
+  } catch (_) {
+    throw new BankHolidaysUnavailableError("network error");
+  }
   if (!resp || !resp.ok) {
     throw new BankHolidaysUnavailableError("upstream status " + (resp ? resp.status : "none"));
   }
@@ -64,7 +72,7 @@ async function fetchBankHolidays(division = "england-and-wales") {
   const events = data[div] && Array.isArray(data[div].events) ? data[div].events : [];
   const map = new Map();
   for (const ev of events) {
-    if (ev.date) map.set(ev.date, ev.title || "Bank Holiday");
+    if (ev && typeof ev.date === "string") map.set(ev.date, ev.title || "Bank Holiday");
   }
   return { division: div, holidays: map, source_url: GOV_UK_BANK_HOLIDAYS_URL };
 }
@@ -124,7 +132,26 @@ function calcThreeClearDays(meetingIso, holidaysMap) {
   };
 }
 
+const AGAR_MAX_SCAN_DAYS = 400;
+
 function calcAgarWindow(year, commencementIso, holidaysMap) {
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+    const err = new RangeError("INVALID_YEAR: expected 2000-2100");
+    err.code = "INVALID_YEAR";
+    throw err;
+  }
+  if (commencementIso && !isValidIsoDate(commencementIso)) {
+    const err = new RangeError("INVALID_COMMENCEMENT_DATE: expected YYYY-MM-DD");
+    err.code = "INVALID_COMMENCEMENT_DATE";
+    throw err;
+  }
+  const scanGuard = (n) => {
+    if (n > AGAR_MAX_SCAN_DAYS) {
+      const err = new RangeError("AGAR_SCAN_LIMIT");
+      err.code = "AGAR_SCAN_LIMIT";
+      throw err;
+    }
+  };
   const isWorkingDay = (d) => {
     const dow = d.getUTCDay();
     const iso = d.toISOString().slice(0, 10);
@@ -133,7 +160,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 
   const julyDays = [];
   const jc = new Date(Date.UTC(year, 6, 1));
-  while (julyDays.length < 10) {
+  for (let n = 0; julyDays.length < 10; n++) {
+    scanGuard(n);
     if (isWorkingDay(jc)) julyDays.push(jc.toISOString().slice(0, 10));
     jc.setUTCDate(jc.getUTCDate() + 1);
   }
@@ -146,7 +174,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
   } else {
     const back = new Date(tenthJulyWd + "T00:00:00Z");
     let count = 0;
-    while (count < 30) {
+    for (let n = 0; count < 30; n++) {
+      scanGuard(n);
       if (isWorkingDay(back)) {
         count++;
         if (count === 30) break;
@@ -158,7 +187,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 
   const workingDays = [];
   const cursor = new Date(startDate.getTime());
-  while (workingDays.length < 30) {
+  for (let n = 0; workingDays.length < 30; n++) {
+    scanGuard(n);
     if (isWorkingDay(cursor)) {
       workingDays.push(cursor.toISOString().slice(0, 10));
     }
@@ -169,7 +199,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
   const actualEnd = workingDays[workingDays.length - 1];
   const noticeCursor = new Date(actualStart + "T00:00:00Z");
   noticeCursor.setUTCDate(noticeCursor.getUTCDate() - 1);
-  while (!isWorkingDay(noticeCursor)) {
+  for (let n = 0; !isWorkingDay(noticeCursor); n++) {
+    scanGuard(n);
     noticeCursor.setUTCDate(noticeCursor.getUTCDate() - 1);
   }
 
@@ -262,8 +293,8 @@ function calcS137AndGpc(electorsCount, totalSeats = 11, electedCouncillors = 7, 
 }
 
 function checkCharity2026Thresholds(grossIncome, grossAssets = 0, structure = "unincorporated_or_cio", fyeIso = "2027-03-31") {
-  const income = Math.max(0, parseFloat(grossIncome || 0));
-  const assets = Math.max(0, parseFloat(grossAssets || 0));
+  const income = Math.max(0, numOr(grossIncome, 0));
+  const assets = Math.max(0, numOr(grossAssets, 0));
   const isCompany = ["charitable_company", "company", "clg"].includes(String(structure || "").toLowerCase());
   const fye = String(fyeIso || "2027-03-31").trim();
   const postSept2026 = fye >= "2026-09-30";
@@ -406,7 +437,9 @@ function calcHmrcBikCap(
     if (gross > 100000) pa = Math.max(0, pa - (gross - 100000) / 2);
     const taxable = Math.max(0, gross - pa);
     const basicBand = 37700;
-    const higherLimit = 125140 - numOr(personalAllowance, 12570);
+    // HMRC rUK bands on taxable income: basic 0-37,700; higher 37,701-125,140; additional over 125,140.
+    // The PA has fully tapered to 0 by £125,140 gross, so the 45% band starts at £125,140 of taxable income.
+    const higherLimit = 125140;
     if (taxable <= basicBand) return taxable * 0.2;
     if (taxable <= higherLimit) return basicBand * 0.2 + (taxable - basicBand) * 0.4;
     return basicBand * 0.2 + (higherLimit - basicBand) * 0.4 + (taxable - higherLimit) * 0.45;
@@ -2617,700 +2650,7 @@ async function handleMcpRpcMessage(msg, isInternal) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Stripe Checkout: "Export Formal Tribunal Appeal Pack" (£24)
-// Hosted Checkout Session redirect only.
-//
-// Day-7 falsification rule (documented in README + /api/rro/telemetry):
-//   clock starts at RRO_CHECKOUT_LIVE_SINCE (set when live-mode keys go on);
-//   at +7 days, if checkout_starts < 10 OR paid == 0  ->  KILL the product.
-//
-// Env (names only — values are Worker secrets, never committed):
-//   STRIPE_SECRET_KEY        secret  sk_test_… (sk_live_… refused unless RRO_STRIPE_LIVE_ENABLED=true)
-//   STRIPE_WEBHOOK_SECRET    secret  whsec_… for /api/rro/stripe-webhook
-//   RRO_STRIPE_LIVE_ENABLED  var     "true" only after the live-mode security review and owner approval
-//   RRO_CHECKOUT_LIVE_SINCE  var     ISO-8601 UTC timestamp the Day-7 clock starts
-//   RRO_CHECKOUT_DB          D1      checkout_start / paid event rows + rate-limit hits
-//   RRO_IP_PEPPER            secret  dedicated HMAC pepper for ip_hash (NOT the whsec); fail closed if missing
-//   RRO_TELEMETRY_TOKEN      secret  optional bearer for full /api/rro/telemetry (public view is minimal)
-//
-// Test-mode conditions implemented here: T1 (test-mode CTA preview gate + label),
-// T2 (D1-first lookup, paid-verdict cache, per-ip_hash limit), T3 (peppered HMAC ip_hash + 48h purge),
-// T4 (exact "true" live flag), T5 (minimal public telemetry, generic checkout errors).
-// TODO(live-gate L1–L10): see deploy/RRO_STRIPE_CHECKOUT.md "Live gate checklist". NOT in this pass.
-// ---------------------------------------------------------------------------
-const RRO_PACK_PRODUCT_KEY = "tribunal_appeal_pack";
-const RRO_PACK_PRODUCT_NAME = "Export Formal Tribunal Appeal Pack";
-const RRO_PACK_PRICE_PENCE = 2400;
-const RRO_PACK_CURRENCY = "gbp";
-const RRO_PUBLIC_ORIGIN = "https://parish.technoplusit.co.uk";
-const RRO_CHECKOUT_RATE_LIMIT = { max_starts: 5, window_minutes: 10 };
-const RRO_LOOKUP_RATE_LIMIT = { max_hits: 30, window_minutes: 10 };
-const RRO_PAID_CACHE_TTL_MS = 10 * 60 * 1000;
-const RRO_IP_HASH_RETENTION_HOURS = 48;
-const RRO_PREVIEW_COOKIE = "rro_preview";
-const RRO_TEST_MODE_LABEL = "TEST MODE – no real payment; do not enter real card details";
-const RRO_PACK_DOWNLOAD_DAYS = 30;
-const RRO_DAY7_RULE = Object.freeze({
-  window_days: 7,
-  min_checkout_starts: 10,
-  min_paid: 1,
-  rule: "At day 7 after RRO_CHECKOUT_LIVE_SINCE: checkout_starts < 10 OR paid == 0 -> kill the £24 Formal Tribunal Appeal Pack",
-});
-const RRO_SESSION_ID_RE = /^cs_(test|live)_[A-Za-z0-9]{10,240}$/;
-const RRO_CHECKOUT_SCHEMA = [
-  "CREATE TABLE IF NOT EXISTS rro_checkout_events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('checkout_start','paid')), stripe_mode TEXT NOT NULL CHECK (stripe_mode IN ('test','live')), session_id TEXT, ip_hash TEXT, amount_total INTEGER, currency TEXT, created_at_utc TEXT NOT NULL)",
-  "CREATE UNIQUE INDEX IF NOT EXISTS ux_rro_checkout_kind_session ON rro_checkout_events(kind, session_id)",
-  "CREATE INDEX IF NOT EXISTS ix_rro_checkout_kind_mode_time ON rro_checkout_events(kind, stripe_mode, created_at_utc)",
-  "CREATE INDEX IF NOT EXISTS ix_rro_checkout_ip_time ON rro_checkout_events(ip_hash, created_at_utc)",
-  "CREATE TABLE IF NOT EXISTS rro_rate_hits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, ip_hash TEXT NOT NULL, created_at_utc TEXT NOT NULL)",
-  "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits ON rro_rate_hits(bucket, ip_hash, created_at_utc)",
-];
-const RRO_CHECKOUT_SCHEMA_READY = new WeakSet();
-
-function rroStripeMode(env) {
-  const key = String((env && env.STRIPE_SECRET_KEY) || "");
-  if (!key) return { ok: false, mode: "unconfigured", reason: "STRIPE_SECRET_KEY_MISSING" };
-  if (/^(sk|rk)_test_[A-Za-z0-9]+$/.test(key)) return { ok: true, mode: "test" };
-  if (/^(sk|rk)_live_[A-Za-z0-9]+$/.test(key)) {
-    // T4 / W-L1: exact, case-sensitive match only ("TRUE", " true", "1" all stay blocked).
-    if (env.RRO_STRIPE_LIVE_ENABLED === "true") return { ok: true, mode: "live" };
-    return { ok: false, mode: "live_blocked", reason: "LIVE_KEY_PRESENT_BUT_RRO_STRIPE_LIVE_ENABLED_NOT_TRUE" };
-  }
-  return { ok: false, mode: "unconfigured", reason: "STRIPE_SECRET_KEY_UNRECOGNISED_PREFIX" };
-}
-
-async function rroEnsureCheckoutSchema(db) {
-  if (RRO_CHECKOUT_SCHEMA_READY.has(db)) return;
-  await db.batch(RRO_CHECKOUT_SCHEMA.map((sql) => db.prepare(sql)));
-  RRO_CHECKOUT_SCHEMA_READY.add(db);
-}
-
-function rroJson(body, status, extraHeaders) {
-  return new Response(JSON.stringify(body), {
-    status: status || 200,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-      "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
-      ...(extraHeaders || {}),
-    },
-  });
-}
-
-// T3 / W-M2: HMAC-SHA256(RRO_IP_PEPPER, day + ":" + ip). Dedicated secret, never the whsec.
-// Returns null when the pepper is missing/too short so callers fail closed (no unkeyed fallback).
-function rroIpPepper(env) {
-  const pepper = typeof (env && env.RRO_IP_PEPPER) === "string" ? env.RRO_IP_PEPPER : "";
-  if (pepper.length < 16) return null;
-  if (env.STRIPE_WEBHOOK_SECRET && pepper === env.STRIPE_WEBHOOK_SECRET) return null;
-  return pepper;
-}
-
-async function rroIpHash(request, env) {
-  const pepper = rroIpPepper(env);
-  if (!pepper) return null;
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  const day = new Date().toISOString().slice(0, 10);
-  return (await rroHmacSha256Hex(pepper, day + ":" + ip)).slice(0, 32);
-}
-
-// T3: retention. ip_hash on event rows is NULLed after 48h; rate-limit hits are deleted after 1h
-// (they are only needed for the 10-minute windows). Runs on write and from the scheduled() handler.
-async function rroPurgeIpHashes(db, nowMs) {
-  const now = typeof nowMs === "number" ? nowMs : Date.now();
-  const eventCutoff = new Date(now - RRO_IP_HASH_RETENTION_HOURS * 3600000).toISOString();
-  const hitCutoff = new Date(now - 3600000).toISOString();
-  await db.prepare("UPDATE rro_checkout_events SET ip_hash = NULL WHERE ip_hash IS NOT NULL AND created_at_utc < ?1").bind(eventCutoff).run();
-  await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
-}
-
-// Reserve-then-check limiter (slot is written BEFORE any Stripe call, so failures count too).
-async function rroRateLimitHit(db, bucket, ipHash, max, windowMinutes) {
-  const nowIso = new Date().toISOString();
-  const windowStart = new Date(Date.now() - windowMinutes * 60000).toISOString();
-  await db.prepare("INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) VALUES (?1, ?2, ?3)").bind(bucket, ipHash, nowIso).run();
-  const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM rro_rate_hits WHERE bucket = ?1 AND ip_hash = ?2 AND created_at_utc >= ?3")
-    .bind(bucket, ipHash, windowStart)
-    .first();
-  return Number((row && row.n) || 0) <= max;
-}
-
-function rroCookie(request, name) {
-  const raw = String(request.headers.get("Cookie") || "");
-  for (const part of raw.split(";")) {
-    const idx = part.indexOf("=");
-    if (idx < 0) continue;
-    if (part.slice(0, idx).trim() === name) return part.slice(idx + 1).trim();
-  }
-  return null;
-}
-
-// T1: in test mode the CTA is only offered to previewers (?rro_preview=1 sets an HttpOnly cookie).
-function rroPreviewRequested(request, url) {
-  return (url && url.searchParams.get(RRO_PREVIEW_COOKIE) === "1") || rroCookie(request, RRO_PREVIEW_COOKIE) === "1";
-}
-
-function rroTimingSafeEqualHex(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-async function rroHmacSha256Hex(secret, message) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>...]  — HMAC-SHA256 over `${t}.${rawBody}`.
-async function rroVerifyStripeSignature(rawBody, header, secret, nowSec, toleranceSec = 300) {
-  if (!secret) return { ok: false, reason: "STRIPE_WEBHOOK_SECRET_MISSING" };
-  if (!header) return { ok: false, reason: "STRIPE_SIGNATURE_MISSING" };
-  let t = null;
-  const v1 = [];
-  for (const part of String(header).split(",")) {
-    const idx = part.indexOf("=");
-    if (idx < 0) continue;
-    const k = part.slice(0, idx).trim();
-    const v = part.slice(idx + 1).trim();
-    if (k === "t") t = v;
-    else if (k === "v1") v1.push(v);
-  }
-  if (!t || !/^\d{1,12}$/.test(t) || v1.length === 0) return { ok: false, reason: "STRIPE_SIGNATURE_MALFORMED" };
-  const now = typeof nowSec === "number" ? nowSec : Math.floor(Date.now() / 1000);
-  if (Math.abs(now - parseInt(t, 10)) > toleranceSec) return { ok: false, reason: "STRIPE_SIGNATURE_TIMESTAMP_OUT_OF_TOLERANCE" };
-  const expected = await rroHmacSha256Hex(secret, t + "." + rawBody);
-  const match = v1.some((sig) => rroTimingSafeEqualHex(sig.toLowerCase(), expected));
-  return match ? { ok: true } : { ok: false, reason: "STRIPE_SIGNATURE_MISMATCH" };
-}
-
-function rroCleanInputs(raw) {
-  const src = raw && typeof raw === "object" ? raw : {};
-  const num = (v, d, lo, hi) => {
-    const n = parseFloat(v);
-    if (!Number.isFinite(n)) return d;
-    return Math.max(lo, Math.min(hi, Math.round(n * 100) / 100));
-  };
-  const regions = ["London", "Southern", "Midlands", "Northern", "Eastern"];
-  const region = regions.includes(String(src.region)) ? String(src.region) : "London";
-  const role = String(src.party_role || src.role || "").toLowerCase().includes("tenant") ? "tenant_claim" : "landlord_defence";
-  const mitigation = String(src.mitigation_factors || src.mitigation || "")
-    .split(/[,;]/)
-    .map((m) => m.trim().toLowerCase())
-    .filter((m) => /^[a-z0-9_]{2,40}$/.test(m))
-    .slice(0, 8)
-    .join(",");
-  return {
-    monthly_rent_gbp: String(num(src.monthly_rent_gbp, 1800, 0, 100000)),
-    months_unlicensed: String(Math.round(num(src.months_unlicensed, 12, 1, 24))),
-    universal_credit_housing_gbp: String(num(src.universal_credit_housing_gbp, 0, 0, 100000)),
-    utilities_included_monthly_gbp: String(num(src.utilities_included_monthly_gbp, 150, 0, 100000)),
-    region,
-    party_role: role,
-    mitigation_factors: mitigation,
-  };
-}
-
-function rroOriginAllowed(request) {
-  const origin = request.headers.get("Origin");
-  if (!origin) return false;
-  const selfOrigin = new URL(request.url).origin;
-  return origin === selfOrigin || origin === RRO_PUBLIC_ORIGIN;
-}
-
-async function rroStripeRequest(env, method, path, form) {
-  const headers = {
-    Authorization: "Bearer " + env.STRIPE_SECRET_KEY,
-    "Stripe-Version": "2024-06-20",
-  };
-  let body;
-  if (form) {
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-    headers["Idempotency-Key"] = crypto.randomUUID();
-    body = new URLSearchParams(form).toString();
-  }
-  const resp = await fetch("https://api.stripe.com" + path, { method, headers, body });
-  let data = null;
-  try {
-    data = await resp.json();
-  } catch (_) {
-    data = null;
-  }
-  return { ok: resp.ok, status: resp.status, data };
-}
-
-async function rroHandleCheckoutCreate(request, env) {
-  if (request.method !== "POST") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "POST" });
-  if (!rroOriginAllowed(request)) return rroJson({ status: "error", error: "ORIGIN_NOT_ALLOWED" }, 403);
-  // T5 / W-L3: one generic error for every misconfiguration; no reason/env/binding names in the body.
-  const mode = rroStripeMode(env);
-  if (!mode.ok || !env.RRO_CHECKOUT_DB || !env.STRIPE_WEBHOOK_SECRET || !rroIpPepper(env)) {
-    return rroJson({ status: "error", error: "CHECKOUT_NOT_CONFIGURED" }, 503);
-  }
-  // T1: test-mode checkout is preview-only so unaware real visitors never land on a Stripe test page.
-  if (mode.mode === "test" && rroCookie(request, RRO_PREVIEW_COOKIE) !== "1") {
-    return rroJson({ status: "error", error: "CHECKOUT_NOT_CONFIGURED" }, 503);
-  }
-
-  const ctype = String(request.headers.get("Content-Type") || "").toLowerCase();
-  let raw = {};
-  const isForm = ctype.includes("application/x-www-form-urlencoded");
-  try {
-    const text = (await request.text()).slice(0, 4096);
-    if (ctype.includes("application/json")) raw = text ? JSON.parse(text) : {};
-    else if (isForm) raw = Object.fromEntries(new URLSearchParams(text));
-    else return rroJson({ status: "error", error: "UNSUPPORTED_CONTENT_TYPE" }, 415);
-  } catch (_) {
-    return rroJson({ status: "error", error: "INVALID_BODY" }, 400);
-  }
-  const inputs = rroCleanInputs(raw);
-
-  const db = env.RRO_CHECKOUT_DB;
-  await rroEnsureCheckoutSchema(db);
-  const ipHash = await rroIpHash(request, env);
-  if (!ipHash) return rroJson({ status: "error", error: "CHECKOUT_NOT_CONFIGURED" }, 503);
-  await rroPurgeIpHashes(db);
-  const allowed = await rroRateLimitHit(db, "checkout", ipHash, RRO_CHECKOUT_RATE_LIMIT.max_starts, RRO_CHECKOUT_RATE_LIMIT.window_minutes);
-  if (!allowed) {
-    return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(RRO_CHECKOUT_RATE_LIMIT.window_minutes * 60) });
-  }
-
-  const form = {
-    mode: "payment",
-    "line_items[0][quantity]": "1",
-    "line_items[0][price_data][currency]": RRO_PACK_CURRENCY,
-    "line_items[0][price_data][unit_amount]": String(RRO_PACK_PRICE_PENCE),
-    "line_items[0][price_data][product_data][name]": RRO_PACK_PRODUCT_NAME,
-    "line_items[0][price_data][product_data][description]":
-      "Formal First-tier Tribunal (Property Chamber) RRO appeal pack: Scott Schedule, quantum workings, comparable GOV.UK precedents and s.44 grounds checklist.",
-    success_url: RRO_PUBLIC_ORIGIN + "/rro/pack/success?session_id={CHECKOUT_SESSION_ID}",
-    cancel_url: RRO_PUBLIC_ORIGIN + "/rro?checkout=cancelled",
-    "metadata[product]": RRO_PACK_PRODUCT_KEY,
-    "payment_intent_data[metadata][product]": RRO_PACK_PRODUCT_KEY,
-  };
-  for (const [k, v] of Object.entries(inputs)) form["metadata[" + k + "]"] = v;
-  if (mode.mode === "test") form["custom_text[submit][message]"] = RRO_TEST_MODE_LABEL + ".";
-
-  const res = await rroStripeRequest(env, "POST", "/v1/checkout/sessions", form);
-  if (!res.ok || !res.data || typeof res.data.url !== "string" || !res.data.id) {
-    return rroJson({ status: "error", error: "STRIPE_SESSION_CREATE_FAILED" }, 502);
-  }
-  let checkoutUrl;
-  try {
-    checkoutUrl = new URL(res.data.url);
-  } catch (_) {
-    checkoutUrl = null;
-  }
-  if (!checkoutUrl || checkoutUrl.protocol !== "https:" || checkoutUrl.hostname !== "checkout.stripe.com") {
-    return rroJson({ status: "error", error: "STRIPE_SESSION_URL_UNEXPECTED" }, 502);
-  }
-
-  await db
-    .prepare("INSERT OR IGNORE INTO rro_checkout_events (kind, stripe_mode, session_id, ip_hash, amount_total, currency, created_at_utc) VALUES ('checkout_start', ?1, ?2, ?3, ?4, ?5, ?6)")
-    .bind(mode.mode, res.data.id, ipHash, RRO_PACK_PRICE_PENCE, RRO_PACK_CURRENCY, new Date().toISOString())
-    .run();
-
-  if (isForm) {
-    return new Response(null, { status: 303, headers: { Location: checkoutUrl.toString(), "Cache-Control": "no-store" } });
-  }
-  return rroJson({ status: "ok", mode: mode.mode, session_id: res.data.id, url: checkoutUrl.toString() });
-}
-
-function rroSessionIsPaidPack(session) {
-  return Boolean(
-    session &&
-      session.object === "checkout.session" &&
-      session.payment_status === "paid" &&
-      session.metadata &&
-      session.metadata.product === RRO_PACK_PRODUCT_KEY &&
-      Number(session.amount_total) === RRO_PACK_PRICE_PENCE &&
-      String(session.currency).toLowerCase() === RRO_PACK_CURRENCY
-  );
-}
-
-async function rroRecordPaid(db, session) {
-  await rroEnsureCheckoutSchema(db);
-  const res = await db
-    .prepare("INSERT OR IGNORE INTO rro_checkout_events (kind, stripe_mode, session_id, ip_hash, amount_total, currency, created_at_utc) VALUES ('paid', ?1, ?2, NULL, ?3, ?4, ?5)")
-    .bind(session.livemode ? "live" : "test", session.id, Number(session.amount_total), String(session.currency).toLowerCase(), new Date().toISOString())
-    .run();
-  return Boolean(res && res.meta && res.meta.changes > 0);
-}
-
-async function rroHandleStripeWebhook(request, env) {
-  if (request.method !== "POST") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "POST" });
-  if (!env.STRIPE_WEBHOOK_SECRET || !env.RRO_CHECKOUT_DB) return rroJson({ status: "error", error: "WEBHOOK_NOT_CONFIGURED" }, 503);
-  // W-L2: refuse oversize bodies from Content-Length before reading; keep the post-read check too.
-  const declaredLen = Number(request.headers.get("Content-Length") || 0);
-  if (Number.isFinite(declaredLen) && declaredLen > 256 * 1024) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
-  const rawBody = await request.text();
-  if (rawBody.length > 256 * 1024) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
-  const ver = await rroVerifyStripeSignature(rawBody, request.headers.get("Stripe-Signature"), env.STRIPE_WEBHOOK_SECRET);
-  if (!ver.ok) return rroJson({ status: "error", error: "SIGNATURE_VERIFICATION_FAILED" }, 400);
-  let event;
-  try {
-    event = JSON.parse(rawBody);
-  } catch (_) {
-    return rroJson({ status: "error", error: "INVALID_JSON" }, 400);
-  }
-  const type = event && event.type;
-  if (type !== "checkout.session.completed" && type !== "checkout.session.async_payment_succeeded") {
-    return rroJson({ status: "ok", ignored: true, type: String(type || "") });
-  }
-  const session = event.data && event.data.object;
-  if (!rroSessionIsPaidPack(session) || !RRO_SESSION_ID_RE.test(String(session.id || ""))) {
-    return rroJson({ status: "ok", ignored: true, reason: "NOT_A_PAID_FORMAL_PACK_SESSION" });
-  }
-  const inserted = await rroRecordPaid(env.RRO_CHECKOUT_DB, session);
-  return rroJson({ status: "ok", recorded: inserted, duplicate: !inserted });
-}
-
-async function rroCountEvents(db, kind, stripeMode, sinceIso) {
-  const row = sinceIso
-    ? await db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events WHERE kind = ?1 AND stripe_mode = ?2 AND created_at_utc >= ?3").bind(kind, stripeMode, sinceIso).first()
-    : await db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events WHERE kind = ?1 AND stripe_mode = ?2").bind(kind, stripeMode).first();
-  return Number((row && row.n) || 0);
-}
-
-function rroValidIso(s) {
-  if (!s) return null;
-  const d = new Date(String(s));
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-async function rroBuildTelemetry(env, nowMs) {
-  const mode = rroStripeMode(env);
-  const now = typeof nowMs === "number" ? nowMs : Date.now();
-  const since = rroValidIso(env && env.RRO_CHECKOUT_LIVE_SINCE);
-  const out = {
-    status: "ok",
-    product: RRO_PACK_PRODUCT_KEY,
-    price_gbp: RRO_PACK_PRICE_PENCE / 100,
-    stripe_mode: mode.mode,
-    checkout_starts: 0,
-    paid: 0,
-    since,
-    by_mode: { test: { checkout_starts: 0, paid: 0 }, live: { checkout_starts: 0, paid: 0 } },
-    day7_kill_rule: { ...RRO_DAY7_RULE, clock_started_at_utc: since, evaluate_at_utc: null, verdict: "clock_not_started" },
-    generated_at_utc: new Date(now).toISOString(),
-  };
-  if (!env || !env.RRO_CHECKOUT_DB) {
-    out.status = "degraded";
-    return out;
-  }
-  const db = env.RRO_CHECKOUT_DB;
-  await rroEnsureCheckoutSchema(db);
-  for (const m of ["test", "live"]) {
-    out.by_mode[m].checkout_starts = await rroCountEvents(db, "checkout_start", m, m === "live" ? since : null);
-    out.by_mode[m].paid = await rroCountEvents(db, "paid", m, m === "live" ? since : null);
-  }
-  const active = mode.mode === "live" ? "live" : "test";
-  out.checkout_starts = out.by_mode[active].checkout_starts;
-  out.paid = out.by_mode[active].paid;
-  if (since) {
-    const evalAt = new Date(new Date(since).getTime() + RRO_DAY7_RULE.window_days * 86400000);
-    out.day7_kill_rule.evaluate_at_utc = evalAt.toISOString();
-    const liveStarts = out.by_mode.live.checkout_starts;
-    const livePaid = out.by_mode.live.paid;
-    const fails = liveStarts < RRO_DAY7_RULE.min_checkout_starts || livePaid < RRO_DAY7_RULE.min_paid;
-    if (now < evalAt.getTime()) out.day7_kill_rule.verdict = fails ? "running_below_threshold" : "running_threshold_met";
-    else out.day7_kill_rule.verdict = fails ? "KILL" : "SURVIVES";
-  }
-  return out;
-}
-
-// T5 / W-L3: public (CORS *) view = status + mode label only. No counts, no revenue, no
-// key-presence (live_blocked collapses to "unavailable"), no env/binding names, no kill-rule internals.
-function rroPublicTelemetry(env) {
-  const mode = rroStripeMode(env);
-  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && env.STRIPE_WEBHOOK_SECRET && rroIpPepper(env));
-  return {
-    status: "ok",
-    product: RRO_PACK_PRODUCT_KEY,
-    price_gbp: RRO_PACK_PRICE_PENCE / 100,
-    mode: configured ? mode.mode : "unavailable",
-  };
-}
-
-function rroTelemetryAuthorised(request, env) {
-  const token = typeof (env && env.RRO_TELEMETRY_TOKEN) === "string" ? env.RRO_TELEMETRY_TOKEN : "";
-  if (token.length < 24) return false;
-  const auth = String(request.headers.get("Authorization") || "");
-  if (!auth.startsWith("Bearer ")) return false;
-  return rroTimingSafeEqualHex(auth.slice(7), token);
-}
-
-// T2: per-isolate paid-verdict cache (<=10 min), bounded. Cache API is used opportunistically too.
-const RRO_PAID_CACHE = new Map();
-function rroPaidCacheGet(sessionId) {
-  const hit = RRO_PAID_CACHE.get(sessionId);
-  if (!hit) return null;
-  if (Date.now() - hit.at > RRO_PAID_CACHE_TTL_MS) {
-    RRO_PAID_CACHE.delete(sessionId);
-    return null;
-  }
-  return hit.session;
-}
-function rroPaidCachePut(sessionId, session) {
-  if (RRO_PAID_CACHE.size >= 500) RRO_PAID_CACHE.delete(RRO_PAID_CACHE.keys().next().value);
-  RRO_PAID_CACHE.set(sessionId, { at: Date.now(), session });
-}
-const RRO_PAID_CACHE_URL = "https://parish.technoplusit.co.uk/__internal_rro_paid_v1/";
-async function rroPaidCacheApiGet(sessionId) {
-  try {
-    if (typeof caches === "undefined" || !caches.default) return null;
-    const r = await caches.default.match(RRO_PAID_CACHE_URL + encodeURIComponent(sessionId));
-    return r ? await r.json() : null;
-  } catch (_) {
-    return null;
-  }
-}
-async function rroPaidCacheApiPut(sessionId, session) {
-  try {
-    if (typeof caches === "undefined" || !caches.default) return;
-    await caches.default.put(
-      RRO_PAID_CACHE_URL + encodeURIComponent(sessionId),
-      new Response(JSON.stringify(session), { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=600" } })
-    );
-  } catch (_) {}
-}
-
-function rroMdEscape(s) {
-  return String(s ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
-}
-
-function rroBuildFormalPack(session) {
-  const md = session.metadata || {};
-  const inputs = rroCleanInputs(md);
-  const calc = calculateRroAwardEdge({ ...inputs, mitigation_factors: inputs.mitigation_factors });
-  const regional = searchRroPrecedentsEdge({ region: inputs.region, limit: 500 });
-  const c = calc.calculation || {};
-  const role = inputs.party_role === "tenant_claim" ? "Applicant tenant(s) — RRO claim & quantum" : "Respondent landlord — s.44 mitigation & defence";
-  const ref = String(session.id || "").slice(-10);
-  const lines = [];
-  lines.push("# Formal Tribunal Appeal Pack — Rent Repayment Order (RRO)");
-  lines.push("");
-  lines.push("First-tier Tribunal (Property Chamber) — Residential Property · Housing and Planning Act 2016 ss.40–44");
-  lines.push("");
-  lines.push("- Pack reference: `" + ref + "`");
-  lines.push("- Generated (UTC): " + new Date().toISOString());
-  lines.push("- Party role: " + role);
-  lines.push("- Tribunal region: " + inputs.region);
-  lines.push("- Data: " + RRO_PRECEDENTS.length + " GOV.UK FTT (Property Chamber) RRO decisions, Open Government Licence v3.0");
-  lines.push("");
-  lines.push("> Not legal advice. This pack is a deterministic, data-derived working bundle to support your own statement of case or appeal. Check every figure against your evidence and the full decision text before filing.");
-  lines.push("");
-  lines.push("## 1. Inputs");
-  lines.push("");
-  lines.push("| Item | Value |");
-  lines.push("|---|---|");
-  lines.push("| Monthly gross rent | £" + inputs.monthly_rent_gbp + " |");
-  lines.push("| Months claimed (1–24) | " + inputs.months_unlicensed + " |");
-  lines.push("| Universal Credit housing element (£/mo) | £" + inputs.universal_credit_housing_gbp + " |");
-  lines.push("| Utilities / council tax included (£/mo) | £" + inputs.utilities_included_monthly_gbp + " |");
-  lines.push("| Mitigation factors asserted | " + rroMdEscape(inputs.mitigation_factors || "none") + " |");
-  lines.push("");
-  lines.push("## 2. Quantum workings (Acheampong v Roman [2022] UKUT 239 (LC) four-stage approach)");
-  lines.push("");
-  lines.push("| Step | Figure |");
-  lines.push("|---|---|");
-  lines.push("| Gross rent in period | £" + c.gross_rent_in_period_gbp + " |");
-  lines.push("| Less Universal Credit | £" + c.uc_deduction_gbp + " |");
-  lines.push("| Less utilities | £" + c.utilities_deduction_gbp + " |");
-  lines.push("| Net eligible rent (maximum RRO) | £" + c.net_eligible_rent_gbp + " |");
-  lines.push("| Offence baseline median | " + c.offence_baseline_median_pct + "% |");
-  lines.push("| Regional direct-award median | " + c.regional_direct_median_pct + "% |");
-  lines.push("| Net s.44(4) conduct/mitigation adjustment | " + c.net_mitigation_pct_adjustment + " pts |");
-  lines.push("| Predicted award band | " + c.predicted_award_pct_low + "% – " + c.predicted_award_pct_high + "% (median " + c.predicted_award_pct_median + "%) |");
-  lines.push("| Predicted award £ band | £" + c.predicted_award_gbp_low + " – £" + c.predicted_award_gbp_high + " (median £" + c.predicted_award_gbp_median + ") |");
-  lines.push("");
-  lines.push("## 3. Scott Schedule");
-  lines.push("");
-  lines.push(String(calc.schedule_markdown || ""));
-  lines.push("");
-  lines.push("## 4. Closest comparable precedents");
-  lines.push("");
-  lines.push("| Case ref | Region | Offence | Claimed £ | Awarded £ | Award % | Decision |");
-  lines.push("|---|---|---|---|---|---|---|");
-  for (const p of calc.comparable_precedents || []) {
-    lines.push("| " + [p.case_ref, p.region, p.offence_type, p.claimed_gbp ?? "", p.awarded_gbp ?? "", p.award_pct_of_rent ?? "", p.pdf_url || ""].map(rroMdEscape).join(" | ") + " |");
-  }
-  lines.push("");
-  lines.push("## 5. Regional bundle — " + inputs.region + " (" + (regional.stats ? regional.stats.total_matched : 0) + " decisions)");
-  lines.push("");
-  if (regional.stats) {
-    lines.push("Median award " + regional.stats.median_award_pct + "% of rent · mean " + regional.stats.mean_award_pct + "% · median £" + regional.stats.median_award_gbp + ".");
-    lines.push("");
-  }
-  lines.push("| Case ref | Date | Offence | Awarded £ | Award % | Source |");
-  lines.push("|---|---|---|---|---|---|");
-  for (const r of (regional.results || []).slice(0, 60)) {
-    lines.push("| " + [r.case_ref, r.decision_date, r.offence_type, r.awarded_gbp ?? "", r.award_pct_of_rent ?? "", r.award_source || ""].map(rroMdEscape).join(" | ") + " |");
-  }
-  lines.push("");
-  lines.push("## 6. Grounds & procedure checklist");
-  lines.push("");
-  lines.push("- [ ] Offence proved beyond reasonable doubt (HPA 2016 s.43(1)); identify the s.40(3) offence (e.g. Housing Act 2004 s.72(1) / s.95(1)).");
-  lines.push("- [ ] Application made within 12 months of the offence (HPA 2016 s.41(2)(b)).");
-  lines.push("- [ ] Period and maximum: rent paid in the relevant period, less Universal Credit (s.44(3)).");
-  lines.push("- [ ] s.44(4) factors evidenced: conduct of landlord and tenant, landlord's financial circumstances, any conviction.");
-  lines.push("- [ ] Seriousness of offence placed against comparables (Williams v Parmar [2021] UKUT 244 (LC); Acheampong v Roman [2022] UKUT 239 (LC)).");
-  lines.push("- [ ] Reasonable-excuse defence considered (Housing Act 2004 s.72(5) / s.95(4)).");
-  lines.push("- [ ] Appeal: permission to appeal to the Upper Tribunal (Lands Chamber) must first be sought from the FTT, normally within 28 days of the written reasons being sent (FTT (Property Chamber) Rules 2013, r.52).");
-  lines.push("");
-  lines.push("_Source data: GOV.UK First-tier Tribunal (Property Chamber) decisions, Open Government Licence v3.0. Generated by parish.technoplusit.co.uk/rro._");
-  const csv = [
-    "# Scott Schedule",
-    String(calc.schedule_csv || ""),
-    "",
-    "# Regional precedents (" + inputs.region + ")",
-    exportRroPrecedentsCsv(regional.results || []),
-  ].join("\n");
-  return { markdown: lines.join("\n") + "\n", csv, calc, inputs };
-}
-
-function rroSessionWithinWindow(session) {
-  const createdMs = Number((session && session.created) || 0) * 1000;
-  return !(createdMs && Date.now() - createdMs > RRO_PACK_DOWNLOAD_DAYS * 86400000);
-}
-
-// T2 / W-M1: order is (1) config + shape checks, (2) per-ip_hash limit (slot reserved first),
-// (3) D1 lookup: a session_id we never created/recorded -> 404 with NO Stripe call,
-// (4) paid-verdict cache (<=10 min), (5) only then GET the session from Stripe.
-async function rroLoadPaidSession(env, sessionId, request) {
-  const mode = rroStripeMode(env);
-  if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroIpPepper(env)) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
-  const sessionMode = String(sessionId).startsWith("cs_live_") ? "live" : "test";
-  if (sessionMode !== mode.mode) return { ok: false, status: 400, error: "SESSION_MODE_MISMATCH" };
-  const db = env.RRO_CHECKOUT_DB;
-  await rroEnsureCheckoutSchema(db);
-  const ipHash = request ? await rroIpHash(request, env) : null;
-  if (!ipHash) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  await rroPurgeIpHashes(db);
-  if (!(await rroRateLimitHit(db, "pack_lookup", ipHash, RRO_LOOKUP_RATE_LIMIT.max_hits, RRO_LOOKUP_RATE_LIMIT.window_minutes))) {
-    return { ok: false, status: 429, error: "RATE_LIMITED" };
-  }
-  const known = await db
-    .prepare("SELECT kind FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2 LIMIT 1")
-    .bind(sessionId, sessionMode)
-    .first();
-  if (!known) return { ok: false, status: 404, error: "SESSION_NOT_FOUND" };
-  const cached = rroPaidCacheGet(sessionId) || (await rroPaidCacheApiGet(sessionId));
-  if (cached && rroSessionIsPaidPack(cached) && cached.id === sessionId) {
-    if (!rroSessionWithinWindow(cached)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
-    return { ok: true, session: cached };
-  }
-  const res = await rroStripeRequest(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId));
-  if (!res.ok || !res.data) return { ok: false, status: res.status === 404 ? 404 : 502, error: "SESSION_LOOKUP_FAILED" };
-  const session = res.data;
-  if (!rroSessionIsPaidPack(session)) return { ok: false, status: 402, error: "PAYMENT_NOT_COMPLETE" };
-  if (session.id !== sessionId) return { ok: false, status: 502, error: "SESSION_LOOKUP_FAILED" };
-  if (!rroSessionWithinWindow(session)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
-  await rroRecordPaid(db, session);
-  rroPaidCachePut(sessionId, session);
-  await rroPaidCacheApiPut(sessionId, session);
-  return { ok: true, session };
-}
-
-function rroSuccessPageHtml(sessionId, session) {
-  const sid = encodeURIComponent(sessionId);
-  const testBanner = session && session.livemode === false
-    ? '<p style="background:#fef3c7;border:1px solid #f59e0b;padding:10px;border-radius:6px;"><strong>Stripe TEST MODE</strong> — no real money was taken.</p>'
-    : "";
-  return '<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Your Formal Tribunal Appeal Pack</title>' +
-    '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;color:#0f172a;line-height:1.5}a.btn{display:inline-block;margin:6px 8px 6px 0;padding:12px 16px;background:#1d4ed8;color:#fff;border-radius:8px;text-decoration:none;font-weight:600}a.sec{background:#475569}</style></head><body>' +
-    "<h1>Payment received — Export Formal Tribunal Appeal Pack</h1>" + testBanner +
-    "<p>Your pack is ready. Download links stay valid for " + RRO_PACK_DOWNLOAD_DAYS + " days from purchase; bookmark this page.</p>" +
-    '<p><a class="btn" href="/api/rro/pack?format=md&amp;session_id=' + sid + '">Download Formal Appeal Pack (Markdown)</a>' +
-    '<a class="btn sec" href="/api/rro/pack?format=csv&amp;session_id=' + sid + '">Download Schedule &amp; Precedents (CSV)</a></p>' +
-    '<p><a href="/rro">&larr; Back to the RRO Precedent Finder</a></p>' +
-    "<p style=\"font-size:13px;color:#64748b\">Not legal advice. Source data: GOV.UK First-tier Tribunal (Property Chamber), OGL v3.0.</p></body></html>";
-}
-
-const RRO_CHECKOUT_HTML_HEADERS = {
-  "Content-Type": "text/html; charset=utf-8",
-  "Cache-Control": "no-store",
-  "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-  "Referrer-Policy": "no-referrer",
-  "X-Content-Type-Options": "nosniff",
-  "X-Frame-Options": "DENY",
-  "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
-};
-
-async function rroHandleCheckoutRoutes(request, env, url) {
-  const p = url.pathname.replace(/\/+$/, "") || "/";
-  if (p === "/api/rro/checkout") return rroHandleCheckoutCreate(request, env);
-  if (p === "/api/rro/stripe-webhook") return rroHandleStripeWebhook(request, env);
-  if (p === "/api/rro/telemetry") {
-    if (request.method !== "GET" && request.method !== "HEAD") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "GET" });
-    // T5: full counters/day-7 internals only with a bearer RRO_TELEMETRY_TOKEN (no CORS); public view is minimal.
-    if (rroTelemetryAuthorised(request, env)) return rroJson(await rroBuildTelemetry(env), 200);
-    return rroJson(rroPublicTelemetry(env), 200, { "Access-Control-Allow-Origin": "*" });
-  }
-  if (p === "/rro/pack/success") {
-    const sid = url.searchParams.get("session_id") || "";
-    const loaded = await rroLoadPaidSession(env, sid, request);
-    if (!loaded.ok) {
-      const msg = loaded.error === "PAYMENT_NOT_COMPLETE" ? "Payment not completed yet. If you just paid, refresh in a few seconds." : "We could not verify this purchase (" + loaded.error + ").";
-      return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Appeal Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Appeal Pack</h1><p>' + escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: loaded.status, headers: RRO_CHECKOUT_HTML_HEADERS });
-    }
-    return new Response(rroSuccessPageHtml(sid, loaded.session), { headers: RRO_CHECKOUT_HTML_HEADERS });
-  }
-  if (p === "/api/rro/pack") {
-    const sid = url.searchParams.get("session_id") || "";
-    const loaded = await rroLoadPaidSession(env, sid, request);
-    if (!loaded.ok) return rroJson({ status: "error", error: loaded.error }, loaded.status);
-    const pack = rroBuildFormalPack(loaded.session);
-    const fmt = String(url.searchParams.get("format") || "md").toLowerCase();
-    const base = "formal-tribunal-appeal-pack-" + pack.inputs.region.toLowerCase() + "-" + String(sid).slice(-8);
-    if (fmt === "csv") {
-      return new Response(pack.csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": 'attachment; filename="' + base + '.csv"', "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
-    }
-    return new Response(pack.markdown, { headers: { "Content-Type": "text/markdown; charset=utf-8", "Content-Disposition": 'attachment; filename="' + base + '.md"', "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
-  }
-  return null;
-}
-
-// T1: render /rro with the CTA state for the current mode.
-//   live (review+owner gated) -> normal £24 CTA
-//   test + preview cookie/param -> CTA with an unmissable TEST MODE label
-//   test without preview, or not configured -> no CTA at all (production visitors never see test checkout)
-const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above.";
-function rroRenderRroPage(request, env, url) {
-  const mode = rroStripeMode(env);
-  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && env.STRIPE_WEBHOOK_SECRET && rroIpPepper(env));
-  const preview = rroPreviewRequested(request, url);
-  let button = "";
-  let note = "";
-  let state = "hidden";
-  if (configured && mode.mode === "live") {
-    state = "live";
-    button = '<button id="formalPackBtn" type="button" style="background:#1d4ed8;">Export Formal Tribunal Appeal Pack — £24</button>';
-    note = '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">' + RRO_CTA_NOTE_TEXT + "</p>";
-  } else if (configured && mode.mode === "test" && preview) {
-    state = "test_preview";
-    button = '<button id="formalPackBtn" type="button" style="background:#b45309;">[TEST MODE] Export Formal Tribunal Appeal Pack — £24</button>';
-    note =
-      '<p id="rroTestModeBanner" role="alert" style="background:#fef3c7;border:2px solid #b45309;color:#78350f;padding:8px 10px;border-radius:6px;font-weight:700;margin:8px 0 0;">' +
-      RRO_TEST_MODE_LABEL + ".</p>" +
-      '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">Stripe test checkout (preview only). ' + RRO_CTA_NOTE_TEXT + "</p>";
-  }
-  const html = RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button).replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note);
-  const extra = { "X-RRO-CTA": state };
-  if (state === "test_preview") {
-    extra["Cache-Control"] = "private, no-store";
-    if (url.searchParams.get(RRO_PREVIEW_COOKIE) === "1") {
-      extra["Set-Cookie"] = RRO_PREVIEW_COOKIE + "=1; Path=/; Max-Age=86400; Secure; HttpOnly; SameSite=Strict";
-    }
-  }
-  return { html, headers: extra };
-}
-// --------------------------- end RRO checkout ---------------------------
+// RRO £24 Stripe Checkout lives in src/rro_core.js, src/rro_checkout.js and src/rro_pages.js.
 
 export default {
   async fetch(request, env = {}, ctx) {
@@ -3405,7 +2745,7 @@ export default {
     }
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
-      const rroPage = rroRenderRroPage(request, env || {}, url);
+      const rroPage = await rroRenderRroPage(request, env || {}, url);
       return new Response(rroPage.html, {
         headers: { ...htmlHeaders, ...rroPage.headers },
       });
@@ -3776,11 +3116,25 @@ export default {
       const charityIncome = url.searchParams.get("charity_income") || "35000";
       const charityAssets = url.searchParams.get("charity_assets") || "150000";
 
-      const [bh, parishLookup, jpagAudit] = await Promise.all([
-        fetchBankHolidays(division),
-        resolvePostcode(postcode),
-        auditDomainJpag(domain),
-      ]);
+      if (!isValidIsoDate(meeting) || (commencement && !isValidIsoDate(commencement)) || !Number.isInteger(year) || year < 2000 || year > 2100) {
+        return Response.json(
+          { status: "error", error: "INVALID_DATE_INPUT", expected: "meeting/commencement YYYY-MM-DD, year 2000-2100" },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+      let bh, parishLookup, jpagAudit;
+      try {
+        [bh, parishLookup, jpagAudit] = await Promise.all([
+          fetchBankHolidays(division),
+          resolvePostcode(postcode),
+          auditDomainJpag(domain),
+        ]);
+      } catch (e) {
+        if (e && e.code === "BANK_HOLIDAYS_UNAVAILABLE") {
+          return Response.json({ status: "error", error: "BANK_HOLIDAYS_UNAVAILABLE" }, { status: 502, headers: corsHeaders });
+        }
+        throw e;
+      }
 
       return Response.json(
         {
@@ -3851,3 +3205,5 @@ export default {
     else await job;
   },
 };
+
+setRroDeps({ RRO_HTML_PAGE, RRO_PRECEDENTS, calculateRroAwardEdge, escapeHtml, exportRroPrecedentsCsv, searchRroPrecedentsEdge });

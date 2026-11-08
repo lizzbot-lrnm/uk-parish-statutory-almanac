@@ -58,3 +58,30 @@ test("calcThreeClearDays: rollback loop also skips 25 December", async () => {
     assert.doesNotMatch(JSON.stringify(body).match(/"latest_publish_date":"[^"]+"/g).join(","), /-12-25/, m);
   }
 });
+
+test("calcHmrcBikCap: 45% additional rate only on taxable income over £125,140 (HMRC rUK 2026/27, PA taper)", async () => {
+  // Expected annual tax: 20% on 37,700 + 40% to 125,140 taxable + 45% above; PA tapers £1 per £2 over £100k.
+  const expected = { 100000: 27432, 116800: 37512, 120000: 39432, 130000: 44703 };
+  for (const [gross, tax] of Object.entries(expected)) {
+    const j = await (await worker.fetch(get("/api/hmrc-bik-cap?cash_salary=" + gross + "&bik=0&periods=12"), {})).json();
+    const annual = j.per_period_summary.cash_only_tax_per_period_gbp * 12;
+    assert.ok(Math.abs(annual - tax) < 1, gross + ": got " + annual + ", want " + tax);
+  }
+});
+
+test("fetchBankHolidays: a network error from gov.uk gives 502 BANK_HOLIDAYS_UNAVAILABLE, not a crash", async () => {
+  globalThis.fetch = async () => { throw new TypeError("network down"); };
+  const r = await worker.fetch(get("/api/three-clear-days?meeting=2026-11-16"), {});
+  assert.equal(r.status, 502);
+  assert.equal((await r.json()).error, "BANK_HOLIDAYS_UNAVAILABLE");
+});
+
+test("/api/almanac: malformed commencement or year is a 400 before any upstream fetch", async () => {
+  let fetched = false;
+  globalThis.fetch = async () => { fetched = true; return new Response(JSON.stringify(BH)); };
+  for (const q of ["commencement=2026-99-01", "year=99999", "meeting=nope"]) {
+    const r = await worker.fetch(get("/api/almanac?" + q), {});
+    assert.equal(r.status, 400, q);
+  }
+  assert.equal(fetched, false);
+});
