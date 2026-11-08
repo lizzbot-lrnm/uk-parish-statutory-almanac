@@ -23,13 +23,45 @@ const S137_RATES_BY_FY = {
   "2026/27": 11.60,
 };
 
+function numOr(value, fallback) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = typeof value === "number" ? value : parseFloat(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+class BankHolidaysUnavailableError extends Error {
+  constructor(reason) {
+    super("BANK_HOLIDAYS_UNAVAILABLE: " + reason);
+    this.code = "BANK_HOLIDAYS_UNAVAILABLE";
+  }
+}
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidIsoDate(s) {
+  if (typeof s !== "string" || !ISO_DATE_RE.test(s)) return false;
+  const d = new Date(s + "T00:00:00Z");
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
 async function fetchBankHolidays(division = "england-and-wales") {
   const resp = await fetch(GOV_UK_BANK_HOLIDAYS_URL, {
     headers: { "User-Agent": "ParishStatutoryAlmanac/1.1 (+https://parish.technoplusit.co.uk)" },
   });
-  const data = await resp.json();
+  if (!resp || !resp.ok) {
+    throw new BankHolidaysUnavailableError("upstream status " + (resp ? resp.status : "none"));
+  }
+  let data;
+  try {
+    data = await resp.json();
+  } catch (_) {
+    throw new BankHolidaysUnavailableError("invalid JSON");
+  }
+  if (!data || typeof data !== "object") {
+    throw new BankHolidaysUnavailableError("unexpected shape");
+  }
   const div = data[division] ? division : "england-and-wales";
-  const events = (data[div] && data[div].events) || [];
+  const events = data[div] && Array.isArray(data[div].events) ? data[div].events : [];
   const map = new Map();
   for (const ev of events) {
     if (ev.date) map.set(ev.date, ev.title || "Bank Holiday");
@@ -38,6 +70,11 @@ async function fetchBankHolidays(division = "england-and-wales") {
 }
 
 function calcThreeClearDays(meetingIso, holidaysMap) {
+  if (!isValidIsoDate(meetingIso)) {
+    const err = new RangeError("INVALID_MEETING_DATE: expected YYYY-MM-DD");
+    err.code = "INVALID_MEETING_DATE";
+    throw err;
+  }
   const trace = (excludeSaturday) => {
     const clearDays = [];
     const skipped = [];
@@ -62,7 +99,8 @@ function calcThreeClearDays(meetingIso, holidaysMap) {
     while (
       d.getUTCDay() === 0 ||
       (excludeSaturday && d.getUTCDay() === 6) ||
-      holidaysMap.has(d.toISOString().slice(0, 10))
+      holidaysMap.has(d.toISOString().slice(0, 10)) ||
+      d.toISOString().slice(0, 10).endsWith("-12-25")
     ) {
       skipped.push({
         date: d.toISOString().slice(0, 10),
@@ -159,10 +197,10 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 }
 
 function calcS137AndGpc(electorsCount, totalSeats = 11, electedCouncillors = 7, clerkCilca = false, proposedSpend = 0, fy = "2026/27") {
-  const electors = Math.max(0, parseInt(electorsCount || 0, 10));
-  const seats = Math.max(1, parseInt(totalSeats || 11, 10));
-  const elected = Math.max(0, Math.min(seats, parseInt(electedCouncillors || 0, 10)));
-  const spend = Math.max(0, parseFloat(proposedSpend || 0));
+  const electors = Math.max(0, Math.trunc(numOr(electorsCount, 0)));
+  const seats = Math.max(1, Math.trunc(numOr(totalSeats, 11)));
+  const elected = Math.max(0, Math.min(seats, Math.trunc(numOr(electedCouncillors, 0))));
+  const spend = Math.max(0, numOr(proposedSpend, 0));
   const validFy = S137_RATES_BY_FY[fy] ? fy : "2026/27";
   const rate = S137_RATES_BY_FY[validFy];
 
@@ -310,8 +348,8 @@ function calcHmrcBikCap(
   bonusMonth = null,
   bonusAmount = 0
 ) {
-  const cashAnnual = Math.max(0, parseFloat(annualCashSalary || 0));
-  const bikAnnual = Math.max(0, parseFloat(annualBik || 0));
+  const cashAnnual = Math.max(0, numOr(annualCashSalary, 0));
+  const bikAnnual = Math.max(0, numOr(annualBik, 0));
   const periods = [1, 4, 12, 26, 52].includes(parseInt(payPeriods, 10)) ? parseInt(payPeriods, 10) : 12;
 
   let regPeriod = 1;
@@ -364,11 +402,11 @@ function calcHmrcBikCap(
   const effectiveAnnualCashPay = Math.round(periodCashList.reduce((a, b) => a + b, 0) * 100) / 100;
 
   const ukAnnualIncomeTax = (gross) => {
-    let pa = parseFloat(personalAllowance || 12570);
+    let pa = numOr(personalAllowance, 12570);
     if (gross > 100000) pa = Math.max(0, pa - (gross - 100000) / 2);
     const taxable = Math.max(0, gross - pa);
     const basicBand = 37700;
-    const higherLimit = 125140 - parseFloat(personalAllowance || 12570);
+    const higherLimit = 125140 - numOr(personalAllowance, 12570);
     if (taxable <= basicBand) return taxable * 0.2;
     if (taxable <= higherLimit) return basicBand * 0.2 + (taxable - basicBand) * 0.4;
     return basicBand * 0.2 + (higherLimit - basicBand) * 0.4 + (taxable - higherLimit) * 0.45;
@@ -2580,8 +2618,8 @@ async function handleMcpRpcMessage(msg, isInternal) {
 }
 
 // ---------------------------------------------------------------------------
-// IDEA-03 SHAPE-O1 — Stripe Checkout: "Export Formal Tribunal Appeal Pack" (£24)
-// Greenlit by Lewis 2026-11-05 11:00 GMT. Hosted Checkout Session redirect only.
+// Stripe Checkout: "Export Formal Tribunal Appeal Pack" (£24)
+// Hosted Checkout Session redirect only.
 //
 // Day-7 falsification rule (documented in README + /api/rro/telemetry):
 //   clock starts at RRO_CHECKOUT_LIVE_SINCE (set when live-mode keys go on);
@@ -2590,20 +2628,18 @@ async function handleMcpRpcMessage(msg, isInternal) {
 // Env (names only — values are Worker secrets, never committed):
 //   STRIPE_SECRET_KEY        secret  sk_test_… (sk_live_… refused unless RRO_STRIPE_LIVE_ENABLED=true)
 //   STRIPE_WEBHOOK_SECRET    secret  whsec_… for /api/rro/stripe-webhook
-//   RRO_STRIPE_LIVE_ENABLED  var     "true" only after Worf clears live mode
+//   RRO_STRIPE_LIVE_ENABLED  var     "true" only after the live-mode security review and owner approval
 //   RRO_CHECKOUT_LIVE_SINCE  var     ISO-8601 UTC timestamp the Day-7 clock starts
 //   RRO_CHECKOUT_DB          D1      checkout_start / paid event rows + rate-limit hits
 //   RRO_IP_PEPPER            secret  dedicated HMAC pepper for ip_hash (NOT the whsec); fail closed if missing
 //   RRO_TELEMETRY_TOKEN      secret  optional bearer for full /api/rro/telemetry (public view is minimal)
 //
-// Worf 2026-11-05 test-mode conditions implemented here: T1 (test-mode CTA preview gate + label),
+// Test-mode conditions implemented here: T1 (test-mode CTA preview gate + label),
 // T2 (D1-first lookup, paid-verdict cache, per-ip_hash limit), T3 (peppered HMAC ip_hash + 48h purge),
 // T4 (exact "true" live flag), T5 (minimal public telemetry, generic checkout errors).
-// TODO(worf-live L1–L10): trader identity, ToS/refunds, CCR reg 37 waiver, privacy notice, not-legal-advice
-// pre-purchase, product rename, OGL free-data note, estimate wording, remove £29 offer (W-L5),
-// paid-only Day-7 rule with named owner (W-M3/W-I4), Lewis-approved live flip. NOT in this pass.
+// TODO(live-gate L1–L10): see deploy/RRO_STRIPE_CHECKOUT.md "Live gate checklist". NOT in this pass.
 // ---------------------------------------------------------------------------
-const RRO_PACK_PRODUCT_KEY = "idea03_formal_tribunal_appeal_pack";
+const RRO_PACK_PRODUCT_KEY = "tribunal_appeal_pack";
 const RRO_PACK_PRODUCT_NAME = "Export Formal Tribunal Appeal Pack";
 const RRO_PACK_PRICE_PENCE = 2400;
 const RRO_PACK_CURRENCY = "gbp";
@@ -2952,7 +2988,7 @@ async function rroBuildTelemetry(env, nowMs) {
   const since = rroValidIso(env && env.RRO_CHECKOUT_LIVE_SINCE);
   const out = {
     status: "ok",
-    product: RRO_PACK_PRODUCT_NAME,
+    product: RRO_PACK_PRODUCT_KEY,
     price_gbp: RRO_PACK_PRICE_PENCE / 100,
     stripe_mode: mode.mode,
     checkout_starts: 0,
@@ -2994,7 +3030,7 @@ function rroPublicTelemetry(env) {
   const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && env.STRIPE_WEBHOOK_SECRET && rroIpPepper(env));
   return {
     status: "ok",
-    product: RRO_PACK_PRODUCT_NAME,
+    product: RRO_PACK_PRODUCT_KEY,
     price_gbp: RRO_PACK_PRICE_PENCE / 100,
     mode: configured ? mode.mode : "unavailable",
   };
@@ -3241,7 +3277,7 @@ async function rroHandleCheckoutRoutes(request, env, url) {
 }
 
 // T1: render /rro with the CTA state for the current mode.
-//   live (Worf+Lewis gated)   -> normal £24 CTA
+//   live (review+owner gated) -> normal £24 CTA
 //   test + preview cookie/param -> CTA with an unmissable TEST MODE label
 //   test without preview, or not configured -> no CTA at all (production visitors never see test checkout)
 const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above.";
@@ -3274,7 +3310,7 @@ function rroRenderRroPage(request, env, url) {
   }
   return { html, headers: extra };
 }
-// --------------------------- end IDEA-03 checkout ---------------------------
+// --------------------------- end RRO checkout ---------------------------
 
 export default {
   async fetch(request, env = {}, ctx) {
@@ -3603,7 +3639,24 @@ export default {
     if (url.pathname === "/api/three-clear-days") {
       const meeting = url.searchParams.get("meeting") || "2026-11-16";
       const division = url.searchParams.get("division") || "england-and-wales";
-      const bh = await fetchBankHolidays(division);
+      if (!isValidIsoDate(meeting)) {
+        return Response.json(
+          { status: "error", error: "INVALID_MEETING_DATE", expected: "YYYY-MM-DD" },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+      let bh;
+      try {
+        bh = await fetchBankHolidays(division);
+      } catch (e) {
+        if (e && e.code === "BANK_HOLIDAYS_UNAVAILABLE") {
+          return Response.json(
+            { status: "error", error: "BANK_HOLIDAYS_UNAVAILABLE" },
+            { status: 502, headers: corsHeaders }
+          );
+        }
+        throw e;
+      }
       return Response.json(
         {
           status: "ok",

@@ -1,5 +1,5 @@
-// node --test tests/  — IDEA-03 £24 Stripe Checkout (no network; Stripe API is mocked).
-// Covers Worf 2026-11-05 test-mode conditions T1–T5 plus the original 15 behaviours.
+// node --test tests/  — £24 RRO Stripe Checkout (no network; Stripe API is mocked).
+// Covers test-mode conditions T1–T5 plus the original 15 behaviours.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
@@ -37,7 +37,7 @@ function paidSession(id = "cs_test_a1B2c3D4e5F6g7H8i9J0", extra = {}) {
   return {
     id, object: "checkout.session", payment_status: "paid", livemode: false,
     amount_total: 2400, currency: "gbp", created: Math.floor(Date.now() / 1000),
-    metadata: { product: "idea03_formal_tribunal_appeal_pack", region: "London", party_role: "landlord_defence", monthly_rent_gbp: "1800", months_unlicensed: "12", universal_credit_housing_gbp: "0", utilities_included_monthly_gbp: "150", mitigation_factors: "good_condition" },
+    metadata: { product: "tribunal_appeal_pack", region: "London", party_role: "landlord_defence", monthly_rent_gbp: "1800", months_unlicensed: "12", universal_credit_housing_gbp: "0", utilities_included_monthly_gbp: "150", mitigation_factors: "good_condition" },
     ...extra,
   };
 }
@@ -342,6 +342,7 @@ test("T5: public telemetry is stripped — status + mode label only; no counts, 
   const raw = await r.text();
   assert.ok(!/sk_(test|live)_|whsec_|checkout_starts|paid|by_mode|day7|kill|live_blocked|RRO_|STRIPE_|detail/i.test(raw), raw);
   assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), ["mode", "price_gbp", "product", "status"]);
+  assert.equal(JSON.parse(raw).product, "tribunal_appeal_pack"); // generic public id, no internal codename
   assert.equal(JSON.parse(raw).mode, "test");
   // live key present but flag not set must not leak key presence
   const blocked = await (await worker.fetch(getReq("/api/rro/telemetry"), env({ STRIPE_SECRET_KEY: FAKE_LIVE_KEY }))).json();

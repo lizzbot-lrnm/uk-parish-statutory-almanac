@@ -1,4 +1,4 @@
--- IDEA-03 SHAPE-O1: £24 Export Formal Tribunal Appeal Pack telemetry (D1 binding RRO_CHECKOUT_DB).
+-- £24 Export Formal Tribunal Appeal Pack telemetry (D1 binding RRO_CHECKOUT_DB).
 -- The Worker also creates these lazily (IF NOT EXISTS); this file is the reviewable source of truth.
 CREATE TABLE IF NOT EXISTS rro_checkout_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS rro_checkout_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rro_checkout_kind_session ON rro_checkout_events(kind, session_id);
 CREATE INDEX IF NOT EXISTS ix_rro_checkout_kind_mode_time ON rro_checkout_events(kind, stripe_mode, created_at_utc);
 CREATE INDEX IF NOT EXISTS ix_rro_checkout_ip_time ON rro_checkout_events(ip_hash, created_at_utc);
--- Worf T2/T3 (2026-11-05): reserve-then-check rate-limit slots for checkout + pack/success lookups.
+-- T2/T3: reserve-then-check rate-limit slots for checkout + pack/success lookups.
 -- Rows are deleted after 1h (only 10-minute windows are needed).
 CREATE TABLE IF NOT EXISTS rro_rate_hits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

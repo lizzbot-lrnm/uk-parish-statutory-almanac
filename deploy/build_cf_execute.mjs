@@ -2,7 +2,7 @@
 // with the RRO_CHECKOUT_DB D1 binding, preserving existing secrets. Contains no secrets.
 import { readFileSync } from "node:fs";
 const code = readFileSync(new URL("../worker.js", import.meta.url), "utf8");
-const message = process.argv[2] || "idea03 stripe checkout";
+const message = process.argv[2] || "rro stripe checkout";
 process.stdout.write(`async () => {
   const code = ${JSON.stringify(code)};
   const DB_NAME = "parish-rro-checkout";
