@@ -23,6 +23,7 @@ import {
   rroCleanInputs,
   rroOriginAllowed,
   rroCheckoutIdempotencyKey,
+  rroBrowserNonce,
   rroStripeRequest,
 } from "./rro_core.js";
 
@@ -84,7 +85,7 @@ async function rroHandleCheckoutCreate(request, env) {
   for (const [k, v] of Object.entries(inputs)) form["metadata[" + k + "]"] = v;
   if (mode.mode === "test") form["custom_text[submit][message]"] = RRO_TEST_MODE_LABEL + ".";
 
-  const idemKey = await rroCheckoutIdempotencyKey(mode.mode, ipHash, inputs);
+  const idemKey = await rroCheckoutIdempotencyKey(mode.mode, ipHash, rroBrowserNonce(request), inputs);
   const res = await rroStripeRequest(env, "POST", "/v1/checkout/sessions", form, idemKey);
   if (!res.ok || !res.data || typeof res.data.url !== "string" || !res.data.id) {
     return rroJson({ status: "error", error: "STRIPE_SESSION_CREATE_FAILED" }, 502);
@@ -278,7 +279,9 @@ function rroPaidCachePut(sessionId, session) {
   if (RRO_PAID_CACHE.size >= 500) RRO_PAID_CACHE.delete(RRO_PAID_CACHE.keys().next().value);
   RRO_PAID_CACHE.set(sessionId, { at: Date.now(), session });
 }
-const RRO_PAID_CACHE_URL = "https://parish.technoplusit.co.uk/__internal_rro_paid_v1/";
+// caches.default keys live under one namespaced internal prefix that no public route serves.
+const RRO_INTERNAL_CACHE_PREFIX = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/";
+const RRO_PAID_CACHE_URL = RRO_INTERNAL_CACHE_PREFIX + "paid/";
 async function rroPaidCacheApiGet(sessionId) {
   try {
     if (typeof caches === "undefined" || !caches.default) return null;
@@ -301,6 +304,7 @@ async function rroPaidCacheApiPut(sessionId, session) {
 
 
 export {
+  RRO_INTERNAL_CACHE_PREFIX,
   rroPaidCacheProject,
   rroHandleCheckoutCreate,
   rroSessionIsPaidPack,

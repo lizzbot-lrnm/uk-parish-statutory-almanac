@@ -243,17 +243,35 @@ function rroOriginAllowed(request) {
   return origin === selfOrigin || origin === RRO_PUBLIC_ORIGIN;
 }
 
-// Deterministic Stripe Idempotency-Key per cart (the cleaned pack inputs) and visitor session (the
-// daily IP hash plus mode), bucketed to 10 minutes, so a retried or double-submitted checkout reuses
-// one Checkout Session instead of creating duplicates.
+// Per-browser nonce: a random HttpOnly cookie set on /rro when the CTA is shown. It separates
+// visitors who share one IP (NAT/CGNAT), so they never share a Stripe Checkout Session.
+const RRO_BROWSER_NONCE_COOKIE = "rro_bn";
+const RRO_BROWSER_NONCE_RE = /^[0-9a-f]{32}$/;
+const RRO_BROWSER_NONCE_TTL_SEC = 86400;
+function rroBrowserNonce(request) {
+  const v = rroCookie(request, RRO_BROWSER_NONCE_COOKIE);
+  return v && RRO_BROWSER_NONCE_RE.test(v) ? v : null;
+}
+function rroNewBrowserNonceCookie() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  const v = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return RRO_BROWSER_NONCE_COOKIE + "=" + v + "; Path=/; Max-Age=" + RRO_BROWSER_NONCE_TTL_SEC + "; Secure; HttpOnly; SameSite=Lax";
+}
+
+// Deterministic Stripe Idempotency-Key per cart (the cleaned pack inputs) and browser (nonce cookie,
+// daily IP hash and mode), bucketed to 10 minutes, so a retried or double-submitted checkout reuses
+// one Checkout Session instead of creating duplicates. Without a valid nonce there is no dedupe:
+// the caller gets null and Stripe gets a fresh random key.
 const RRO_IDEMPOTENCY_BUCKET_SEC = 600;
-async function rroCheckoutIdempotencyKey(mode, ipHash, inputs, nowSec = Date.now() / 1000) {
+async function rroCheckoutIdempotencyKey(mode, ipHash, nonce, inputs, nowSec = Date.now() / 1000) {
+  if (!nonce || !RRO_BROWSER_NONCE_RE.test(String(nonce))) return null;
   const cart = Object.keys(inputs || {})
     .sort()
     .map((k) => k + "=" + String(inputs[k]))
     .join("&");
   const bucket = Math.floor(nowSec / RRO_IDEMPOTENCY_BUCKET_SEC);
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("rro-checkout-v1|" + mode + "|" + ipHash + "|" + cart + "|" + bucket));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("rro-checkout-v2|" + mode + "|" + ipHash + "|" + nonce + "|" + cart + "|" + bucket));
   return "rro-cs-" + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 48);
 }
 
@@ -321,5 +339,7 @@ export {
   rroCleanInputs,
   rroOriginAllowed,
   rroCheckoutIdempotencyKey,
+  rroBrowserNonce,
+  rroNewBrowserNonceCookie,
   rroStripeRequest,
 };

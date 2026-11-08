@@ -1756,7 +1756,7 @@ function auditPrivateRroClaimEdge(payload = {}) {
   }
 }
 
-const RRO_STATS_CACHE_URL = "https://parish.technoplusit.co.uk/__internal_rro_stats_v2";
+const RRO_STATS_CACHE_URL = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/stats";
 const RRO_ALLOWED_EVENTS = new Set(["search", "calculator_run", "pack_download", "private_audit", "buy_pack_click"]);
 const RRO_EDGE_COUNTERS = {
   daily_totals: {},
@@ -2746,10 +2746,10 @@ export default {
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
       const rroPage = await rroRenderRroPage(request, env || {}, url);
-      if (rroPage.redirect) return new Response(null, { status: 302, headers: rroPage.headers });
-      return new Response(rroPage.html, {
-        headers: { ...htmlHeaders, ...rroPage.headers },
-      });
+      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...htmlHeaders, ...rroPage.headers });
+      for (const c of rroPage.cookies || []) rroHeaders.append("Set-Cookie", c);
+      if (rroPage.redirect) return new Response(null, { status: 302, headers: rroHeaders });
+      return new Response(rroPage.html, { headers: rroHeaders });
     }
 
     if (

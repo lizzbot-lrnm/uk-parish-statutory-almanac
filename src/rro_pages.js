@@ -18,6 +18,8 @@ import {
   rroPreviewCookieValid,
   rroPreviewLinkValid,
   rroCleanInputs,
+  rroBrowserNonce,
+  rroNewBrowserNonceCookie,
   rroStripeRequest,
 } from "./rro_core.js";
 import {
@@ -136,8 +138,10 @@ function rroBuildFormalPack(session) {
 }
 
 function rroSessionWithinWindow(session) {
-  const createdMs = Number((session && session.created) || 0) * 1000;
-  return !(createdMs && Date.now() - createdMs > RRO_PACK_DOWNLOAD_DAYS * 86400000);
+  // Fail closed: a missing, zero, negative or non-finite `created` is treated as outside the window.
+  const created = Number(session && session.created);
+  if (!Number.isFinite(created) || created <= 0) return false;
+  return Date.now() - created * 1000 <= RRO_PACK_DOWNLOAD_DAYS * 86400000;
 }
 
 // T2 / W-M1: order is (1) config + shape checks, (2) per-ip_hash limit (slot reserved first),
@@ -271,16 +275,25 @@ async function rroRenderRroPage(request, env, url) {
   const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button).replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note);
   // The page varies on the preview cookie: never let a shared cache serve one visitor's variant to another.
   const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer", "Cache-Control": "private, no-store", Vary: "Cookie" };
+  const cookies = [];
+  // The per-browser idempotency nonce is only issued where a checkout can actually start.
+  const nonceCookie = state !== "hidden" && !rroBrowserNonce(request) ? rroNewBrowserNonceCookie() : null;
   if (state === "test_preview") {
     if (viaLink) {
       // Strip the token from the URL bar, history and Referer: 302 to /rro carrying the signed cookie.
+      // SameSite=Lax so the cookie survives Stripe's top-level cancel redirect back to /rro.
       const cookie = await rroPreviewCookieFor(rroPreviewSecret(env), Date.now() / 1000);
-      extra["Set-Cookie"] = RRO_PREVIEW_COOKIE + "=" + cookie + "; Path=/; Max-Age=" + RRO_PREVIEW_TTL_SEC + "; Secure; HttpOnly; SameSite=Strict";
+      cookies.push(RRO_PREVIEW_COOKIE + "=" + cookie + "; Path=/; Max-Age=" + RRO_PREVIEW_TTL_SEC + "; Secure; HttpOnly; SameSite=Lax");
+      if (nonceCookie) cookies.push(nonceCookie);
       extra.Location = "/rro";
-      return { redirect: true, html: "", headers: extra };
+      extra["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains";
+      extra["X-Content-Type-Options"] = "nosniff";
+      extra["X-Frame-Options"] = "DENY";
+      return { redirect: true, html: "", headers: extra, cookies };
     }
   }
-  return { html, headers: extra };
+  if (nonceCookie) cookies.push(nonceCookie);
+  return { html, headers: extra, cookies };
 }
 // --------------------------- end RRO checkout ---------------------------
 

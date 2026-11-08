@@ -410,7 +410,7 @@ test("T1: /rro?rro_preview=<signed token> in test mode shows CTA with TEST MODE 
   assert.match(html, /\[TEST MODE\] Export Formal Tribunal Appeal Pack — £24/);
   assert.match(html, /TEST MODE – no real payment; do not enter real card details/);
   assert.equal(r.headers.get("X-RRO-CTA"), "test_preview");
-  assert.match(setCookie, /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Strict/);
+  assert.match(setCookie, /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Lax/);
   assert.match(r.headers.get("Cache-Control"), /no-store/);
   const viaCookie = await worker.fetch(getReq("/rro", PREVIEW), env());
   assert.match(await viaCookie.text(), /TEST MODE – no real payment/);
@@ -624,23 +624,102 @@ test("F3: no preview token reaches worker logs on the preview link redirect", as
   assert.ok(lines.every((l) => !l.includes(hex)));
 });
 
-test("F4: Stripe Idempotency-Key is deterministic per cart and visitor session, so retries do not duplicate", async () => {
+test("F4: Stripe Idempotency-Key is deterministic per cart and browser nonce, so retries do not duplicate", async () => {
   const keys = [];
   mockStripe((url, init) => {
     keys.push(init.headers["Idempotency-Key"]);
     return jsonResp({ id: "cs_test_SESSION0000000009", url: "https://checkout.stripe.com/c/pay/cs_test_SESSION0000000009" });
   });
   const e = env();
+  const nA = "rro_bn=" + "a".repeat(32);
+  const nB = "rro_bn=" + "b".repeat(32);
+  const withNonce = (n, extra = {}) => ({ Cookie: PREVIEW.Cookie + "; " + n, ...extra });
   const body = { region: "Northern", monthly_rent_gbp: 950 };
-  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
-  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
-  assert.equal((await worker.fetch(checkoutReq({ region: "Northern", monthly_rent_gbp: 951 }), e)).status, 200);
-  assert.equal((await worker.fetch(checkoutReq(body, { "CF-Connecting-IP": "198.51.100.9" }), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body, withNonce(nA)), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body, withNonce(nA)), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq({ region: "Northern", monthly_rent_gbp: 951 }, withNonce(nA)), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body, withNonce(nA, { "CF-Connecting-IP": "198.51.100.9" })), e)).status, 200);
   assert.equal(keys.length, 4);
   assert.match(keys[0], /^rro-cs-[0-9a-f]{48}$/);
   assert.equal(keys[0], keys[1]);
   assert.notEqual(keys[0], keys[2]);
   assert.notEqual(keys[0], keys[3]);
+});
+
+test("F6: two browsers behind one IP (NAT) with the same cart get different Idempotency-Keys", async () => {
+  const keys = [];
+  mockStripe((url, init) => {
+    keys.push(init.headers["Idempotency-Key"]);
+    return jsonResp({ id: "cs_test_SESSION0000000010", url: "https://checkout.stripe.com/c/pay/cs_test_SESSION0000000010" });
+  });
+  const e = env();
+  const body = { region: "Northern", monthly_rent_gbp: 950 };
+  for (const n of ["a", "b"]) {
+    const r = await worker.fetch(checkoutReq(body, { Cookie: PREVIEW.Cookie + "; rro_bn=" + n.repeat(32) }), e);
+    assert.equal(r.status, 200);
+  }
+  assert.notEqual(keys[0], keys[1]);
+});
+
+test("F7: with no (or a malformed) nonce cookie every checkout gets a fresh random key — no dedupe", async () => {
+  const keys = [];
+  mockStripe((url, init) => {
+    keys.push(init.headers["Idempotency-Key"]);
+    return jsonResp({ id: "cs_test_SESSION0000000011", url: "https://checkout.stripe.com/c/pay/cs_test_SESSION0000000011" });
+  });
+  const e = env();
+  const body = { region: "Northern", monthly_rent_gbp: 950 };
+  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body), e)).status, 200);
+  assert.equal((await worker.fetch(checkoutReq(body, { Cookie: PREVIEW.Cookie + "; rro_bn=not-hex" }), e)).status, 200);
+  assert.equal(new Set(keys).size, 3);
+  for (const k of keys) assert.doesNotMatch(k, /^rro-cs-/);
+});
+
+test("F8: /rro issues an HttpOnly Secure SameSite=Lax nonce cookie only when the CTA is shown, and keeps a valid one", async () => {
+  const link = await worker.fetch(getReq("/rro?rro_preview=" + previewLink()), env(), { redirect: "manual" });
+  const all = link.headers.getSetCookie();
+  assert.equal(all.length, 2);
+  assert.match(all[0], /^rro_preview=/);
+  assert.match(all[1], /^rro_bn=[0-9a-f]{32}; Path=\/; Max-Age=\d+; Secure; HttpOnly; SameSite=Lax$/);
+  const kept = await worker.fetch(getReq("/rro", { Cookie: PREVIEW.Cookie + "; rro_bn=" + "c".repeat(32) }), env());
+  assert.deepEqual(kept.headers.getSetCookie(), []);
+  const fresh = await worker.fetch(getReq("/rro", PREVIEW), env());
+  assert.match(fresh.headers.getSetCookie()[0] || "", /^rro_bn=[0-9a-f]{32};/);
+  const hidden = await worker.fetch(getReq("/rro"), env());
+  assert.deepEqual(hidden.headers.getSetCookie(), []);
+});
+
+test("F9: pack downloads fail closed when the session's created time is 0, missing or junk", async () => {
+  for (const created of [0, undefined, "abc", -5]) {
+    const session = paidSession("cs_test_CREATEDZERO0000000001", { created });
+    mockStripe(() => jsonResp(session));
+    const e = env();
+    seedStart(e, session.id);
+    const r = await worker.fetch(getReq("/api/rro/pack?session_id=" + session.id), e);
+    assert.equal(r.status, 410, String(created));
+  }
+});
+
+test("F10: the preview-link 302 carries HSTS, nosniff and X-Frame-Options DENY", async () => {
+  const r = await worker.fetch(getReq("/rro?rro_preview=" + previewLink()), env(), { redirect: "manual" });
+  assert.equal(r.status, 302);
+  assert.match(r.headers.get("Strict-Transport-Security"), /max-age=31536000/);
+  assert.equal(r.headers.get("X-Content-Type-Options"), "nosniff");
+  assert.equal(r.headers.get("X-Frame-Options"), "DENY");
+});
+
+test("F11: caches.default keys share one namespaced internal prefix that no public route serves", async () => {
+  const { RRO_INTERNAL_CACHE_PREFIX, RRO_PAID_CACHE_URL } = await import("../src/rro_checkout.js");
+  assert.equal(RRO_INTERNAL_CACHE_PREFIX, "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/");
+  assert.ok(RRO_PAID_CACHE_URL.startsWith(RRO_INTERNAL_CACHE_PREFIX));
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("../worker.js", import.meta.url), "utf8") + fs.readFileSync(new URL("../src/rro_checkout.js", import.meta.url), "utf8");
+  const keys = [...src.matchAll(/"(https:\/\/parish\.technoplusit\.co\.uk\/__[^"]*)"/g)].map((m) => m[1]);
+  assert.ok(keys.length >= 2);
+  for (const k of keys) assert.ok(k.startsWith(RRO_INTERNAL_CACHE_PREFIX), k);
+  const pub = await worker.fetch(getReq("/__rro_internal_cache/v1/paid/cs_test_X"), env());
+  assert.equal(pub.status, 404);
 });
 
 test("F5: /api/rro/buy-pack is no longer advertised in available_endpoints (route itself unchanged)", async () => {
