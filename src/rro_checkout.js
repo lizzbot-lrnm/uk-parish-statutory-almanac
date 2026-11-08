@@ -40,12 +40,16 @@ async function rroHandleCheckoutCreate(request, env) {
 
   const ctype = String(request.headers.get("Content-Type") || "").toLowerCase();
   let raw = {};
-  const isForm = ctype.includes("application/x-www-form-urlencoded");
+  const isJson = ctype.includes("application/json");
+  const isForm = !isJson && ctype.includes("application/x-www-form-urlencoded");
+  if (!isJson && !isForm) return rroJson({ status: "error", error: "UNSUPPORTED_CONTENT_TYPE" }, 415);
+  const declaredLen = Number(request.headers.get("Content-Length") || 0);
+  if (Number.isFinite(declaredLen) && declaredLen > 4096) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
   try {
-    const text = (await request.text()).slice(0, 4096);
-    if (ctype.includes("application/json")) raw = text ? JSON.parse(text) : {};
-    else if (isForm) raw = Object.fromEntries(new URLSearchParams(text));
-    else return rroJson({ status: "error", error: "UNSUPPORTED_CONTENT_TYPE" }, 415);
+    const text = await request.text();
+    if (text.length > 4096) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
+    if (isJson) raw = text ? JSON.parse(text) : {};
+    else raw = Object.fromEntries(new URLSearchParams(text));
   } catch (_) {
     return rroJson({ status: "error", error: "INVALID_BODY" }, 400);
   }
@@ -147,6 +151,12 @@ async function rroHandleStripeWebhook(request, env) {
   if (!rroSessionIsPaidPack(session) || !RRO_SESSION_ID_RE.test(String(session.id || ""))) {
     return rroJson({ status: "ok", ignored: true, reason: "NOT_A_PAID_FORMAL_PACK_SESSION" });
   }
+  // Mode consistency: livemode must match the configured key mode and the session id prefix;
+  // live events are refused unless the Worker is in (gated) live mode.
+  const expectLive = rroStripeMode(env).mode === "live";
+  if (session.livemode !== expectLive || String(session.id).startsWith("cs_live_") !== (session.livemode === true)) {
+    return rroJson({ status: "error", error: "MODE_MISMATCH" }, 400);
+  }
   const inserted = await rroRecordPaid(env.RRO_CHECKOUT_DB, session);
   return rroJson({ status: "ok", recorded: inserted, duplicate: !inserted });
 }
@@ -237,7 +247,23 @@ function rroPaidCacheGet(sessionId) {
   }
   return hit.session;
 }
+// Data minimisation: only the fields the paid-pack checks and pack rendering need are cached
+// (never customer_details, email, name, phone or address).
+function rroPaidCacheProject(session) {
+  const s = session || {};
+  return {
+    id: s.id,
+    object: s.object,
+    payment_status: s.payment_status,
+    livemode: s.livemode,
+    amount_total: s.amount_total,
+    currency: s.currency,
+    created: s.created,
+    metadata: s.metadata && typeof s.metadata === "object" ? { ...s.metadata } : null,
+  };
+}
 function rroPaidCachePut(sessionId, session) {
+  session = rroPaidCacheProject(session);
   if (RRO_PAID_CACHE.size >= 500) RRO_PAID_CACHE.delete(RRO_PAID_CACHE.keys().next().value);
   RRO_PAID_CACHE.set(sessionId, { at: Date.now(), session });
 }
@@ -252,6 +278,7 @@ async function rroPaidCacheApiGet(sessionId) {
   }
 }
 async function rroPaidCacheApiPut(sessionId, session) {
+  session = rroPaidCacheProject(session);
   try {
     if (typeof caches === "undefined" || !caches.default) return;
     await caches.default.put(
@@ -263,6 +290,7 @@ async function rroPaidCacheApiPut(sessionId, session) {
 
 
 export {
+  rroPaidCacheProject,
   rroHandleCheckoutCreate,
   rroSessionIsPaidPack,
   rroRecordPaid,

@@ -2746,6 +2746,7 @@ export default {
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
       const rroPage = await rroRenderRroPage(request, env || {}, url);
+      if (rroPage.redirect) return new Response(null, { status: 302, headers: rroPage.headers });
       return new Response(rroPage.html, {
         headers: { ...htmlHeaders, ...rroPage.headers },
       });

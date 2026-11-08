@@ -108,16 +108,19 @@ async function rroPurgeIpHashes(db, nowMs) {
   await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
 }
 
-// Reserve-then-check limiter (slot is written BEFORE any Stripe call, so failures count too).
+// Read-then-reserve limiter: an over-limit caller is refused with a single read and NO write, so a
+// flood cannot extend its own lockout or amplify D1 writes. An allowed caller's slot is written BEFORE
+// any Stripe call, so failures still count.
 async function rroRateLimitHit(db, bucket, ipHash, max, windowMinutes) {
   const nowIso = new Date().toISOString();
   const windowStart = new Date(Date.now() - windowMinutes * 60000).toISOString();
-  await db.prepare("INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) VALUES (?1, ?2, ?3)").bind(bucket, ipHash, nowIso).run();
   const row = await db
     .prepare("SELECT COUNT(*) AS n FROM rro_rate_hits WHERE bucket = ?1 AND ip_hash = ?2 AND created_at_utc >= ?3")
     .bind(bucket, ipHash, windowStart)
     .first();
-  return Number((row && row.n) || 0) <= max;
+  if (Number((row && row.n) || 0) >= max) return false;
+  await db.prepare("INSERT INTO rro_rate_hits (bucket, ip_hash, created_at_utc) VALUES (?1, ?2, ?3)").bind(bucket, ipHash, nowIso).run();
+  return true;
 }
 
 function rroCookie(request, name) {
@@ -241,7 +244,12 @@ async function rroStripeRequest(env, method, path, form) {
     headers["Idempotency-Key"] = crypto.randomUUID();
     body = new URLSearchParams(form).toString();
   }
-  const resp = await fetch("https://api.stripe.com" + path, { method, headers, body });
+  let resp;
+  try {
+    resp = await fetch("https://api.stripe.com" + path, { method, headers, body });
+  } catch (_) {
+    return { ok: false, status: 502, data: null };
+  }
   let data = null;
   try {
     data = await resp.json();

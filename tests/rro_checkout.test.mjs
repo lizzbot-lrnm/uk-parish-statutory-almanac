@@ -392,13 +392,22 @@ test("T1: /rro hides the £24 CTA in test mode without preview, and when unconfi
 });
 
 test("T1: /rro?rro_preview=<signed token> in test mode shows CTA with TEST MODE label and sets signed HttpOnly preview cookie", async () => {
-  const r = await worker.fetch(getReq("/rro?rro_preview=" + PREVIEW_LINK_TOKEN), env());
+  const link = await worker.fetch(getReq("/rro?rro_preview=" + PREVIEW_LINK_TOKEN), env(), { redirect: "manual" });
+  // M3: the token is stripped by a 302 to /rro that carries the signed cookie and no-referrer.
+  assert.equal(link.status, 302);
+  assert.equal(link.headers.get("Location"), "/rro");
+  assert.equal(link.headers.get("Referrer-Policy"), "no-referrer");
+  assert.match(link.headers.get("Cache-Control"), /no-store/);
+  assert.equal(await link.text(), "");
+  const setCookie = link.headers.get("Set-Cookie");
+  const r = await worker.fetch(getReq("/rro", { Cookie: setCookie.split(";")[0] }), env());
   const html = await r.text();
+  assert.equal(r.headers.get("Referrer-Policy"), "no-referrer");
   assert.match(html, /id="formalPackBtn"/);
   assert.match(html, /\[TEST MODE\] Export Formal Tribunal Appeal Pack — £24/);
   assert.match(html, /TEST MODE – no real payment; do not enter real card details/);
   assert.equal(r.headers.get("X-RRO-CTA"), "test_preview");
-  assert.match(r.headers.get("Set-Cookie"), /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Strict/);
+  assert.match(setCookie, /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Strict/);
   assert.match(r.headers.get("Cache-Control"), /no-store/);
   const viaCookie = await worker.fetch(getReq("/rro", PREVIEW), env());
   assert.match(await viaCookie.text(), /TEST MODE – no real payment/);
@@ -437,4 +446,64 @@ test("T1: missing RRO_PREVIEW_SECRET fails closed — even a well-formed cookie 
   assert.equal(page.headers.get("X-RRO-CTA"), "hidden");
   const r = await worker.fetch(checkoutReq(), env({ RRO_PREVIEW_SECRET: undefined }));
   assert.equal(r.status, 503);
+});
+
+// ---------------------------------------------------------------- review round 3 (M1-M4, L1)
+test("M1: paid cache and pack keep only the minimal session fields — never customer_details", async () => {
+  const { rroPaidCacheProject } = await import("../src/rro_checkout.js");
+  const pii = { customer_details: { email: "pii-test@example.invalid", name: "PII Person", phone: "+440000", address: { line1: "1 PII St" } }, customer_email: "pii-test@example.invalid" };
+  const projected = rroPaidCacheProject(paidSession("cs_test_PROJECT0000000001", pii));
+  assert.deepEqual(Object.keys(projected).sort(), ["amount_total", "created", "currency", "id", "livemode", "metadata", "object", "payment_status"]);
+  const e = env();
+  const session = paidSession("cs_test_PIICACHE000000001", pii);
+  seedStart(e, session.id);
+  mockStripe(() => jsonResp(session));
+  const body = await (await worker.fetch(getReq("/api/rro/pack?session_id=" + session.id), e)).text();
+  assert.doesNotMatch(body, /pii-test@example\.invalid|PII Person|1 PII St/);
+  noStripe();
+  const again = await worker.fetch(getReq("/api/rro/pack?session_id=" + session.id), e);
+  assert.equal(again.status, 200);
+  assert.doesNotMatch(await again.text(), /pii-test@example\.invalid|PII Person/);
+});
+
+test("M2: over-limit pack lookups are refused with no D1 write, and lookups never run the retention purge", async () => {
+  noStripe();
+  const e = env();
+  const db = e.RRO_CHECKOUT_DB._db;
+  seedStart(e, "cs_test_OLDPURGE000000001");
+  db.prepare("UPDATE rro_checkout_events SET created_at_utc = ? WHERE session_id = ?").run(new Date(Date.now() - 49 * 3600000).toISOString(), "cs_test_OLDPURGE000000001");
+  for (let i = 0; i < 30; i++) await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_RLW" + String(i).padStart(17, "0")), e);
+  const hits = () => db.prepare("SELECT COUNT(*) AS n FROM rro_rate_hits").get().n;
+  assert.equal(hits(), 30);
+  for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(getReq("/rro/pack/success?session_id=cs_test_RLWOVER00000000001"), e)).status, 429);
+  assert.equal(hits(), 30, "over-limit requests must not insert");
+  assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, "seed", "GET lookups must not purge");
+  await worker.scheduled({}, e);
+  assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, null);
+});
+
+test("M4: Stripe network error -> 502 JSON; oversize Content-Length -> 413 before read; unsupported type -> 415", async () => {
+  mockStripe(() => { throw new TypeError("network down"); });
+  const r = await worker.fetch(checkoutReq(), env());
+  assert.equal(r.status, 502);
+  assert.equal((await r.json()).error, "STRIPE_SESSION_CREATE_FAILED");
+  noStripe();
+  const big = await worker.fetch(checkoutReq({}, { "Content-Length": "5000" }), env());
+  assert.equal(big.status, 413);
+  const bigBody = await worker.fetch(checkoutReq({ pad: "x".repeat(5000) }), env());
+  assert.equal(bigBody.status, 413);
+  const plain = await worker.fetch(checkoutReq({}, { "Content-Type": "text/plain" }), env());
+  assert.equal(plain.status, 415);
+  assert.equal(stripeCalls.length, 0);
+});
+
+test("L1: webhook rejects livemode that mismatches the configured mode or the session id prefix", async () => {
+  const e = env();
+  const liveEvent = { type: "checkout.session.completed", data: { object: paidSession("cs_live_LIVEINTEST00000001", { livemode: true }) } };
+  assert.equal((await worker.fetch(webhookReq(liveEvent), e)).status, 400);
+  const forged = { type: "checkout.session.completed", data: { object: paidSession("cs_live_PREFIXLIE00000001", { livemode: false }) } };
+  assert.equal((await worker.fetch(webhookReq(forged), e)).status, 400);
+  const ok = { type: "checkout.session.completed", data: { object: paidSession("cs_test_MODEOK0000000001") } };
+  assert.equal((await (await worker.fetch(webhookReq(ok), e)).json()).recorded, true);
+  assert.equal((await fullTelemetry(e)).paid, 1);
 });

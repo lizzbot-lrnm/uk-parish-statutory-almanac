@@ -32,6 +32,7 @@ import {
   rroPaidCachePut,
   rroPaidCacheApiGet,
   rroPaidCacheApiPut,
+  rroPaidCacheProject,
 } from "./rro_checkout.js";
 
 // Site data/helpers that live in worker.js are injected (no circular import).
@@ -152,7 +153,7 @@ async function rroLoadPaidSession(env, sessionId, request) {
   await rroEnsureCheckoutSchema(db);
   const ipHash = request ? await rroIpHash(request, env) : null;
   if (!ipHash) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  await rroPurgeIpHashes(db);
+  // No retention purge on this unauthenticated GET path: it runs from scheduled() and on checkout writes.
   if (!(await rroRateLimitHit(db, "pack_lookup", ipHash, RRO_LOOKUP_RATE_LIMIT.max_hits, RRO_LOOKUP_RATE_LIMIT.window_minutes))) {
     return { ok: false, status: 429, error: "RATE_LIMITED" };
   }
@@ -173,9 +174,10 @@ async function rroLoadPaidSession(env, sessionId, request) {
   if (session.id !== sessionId) return { ok: false, status: 502, error: "SESSION_LOOKUP_FAILED" };
   if (!rroSessionWithinWindow(session)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
   await rroRecordPaid(db, session);
-  rroPaidCachePut(sessionId, session);
-  await rroPaidCacheApiPut(sessionId, session);
-  return { ok: true, session };
+  const minimal = rroPaidCacheProject(session);
+  rroPaidCachePut(sessionId, minimal);
+  await rroPaidCacheApiPut(sessionId, minimal);
+  return { ok: true, session: minimal };
 }
 
 function rroSuccessPageHtml(sessionId, session) {
@@ -263,12 +265,15 @@ async function rroRenderRroPage(request, env, url) {
       '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">Stripe test checkout (preview only). ' + RRO_CTA_NOTE_TEXT + "</p>";
   }
   const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button).replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note);
-  const extra = { "X-RRO-CTA": state };
+  const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer" };
   if (state === "test_preview") {
     extra["Cache-Control"] = "private, no-store";
     if (viaLink) {
+      // Strip the token from the URL bar, history and Referer: 302 to /rro carrying the signed cookie.
       const cookie = await rroPreviewCookieFor(rroPreviewSecret(env), Date.now() / 1000);
       extra["Set-Cookie"] = RRO_PREVIEW_COOKIE + "=" + cookie + "; Path=/; Max-Age=" + RRO_PREVIEW_TTL_SEC + "; Secure; HttpOnly; SameSite=Strict";
+      extra.Location = "/rro";
+      return { redirect: true, html: "", headers: extra };
     }
   }
   return { html, headers: extra };
