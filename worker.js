@@ -13,6 +13,21 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
+import { rroEnsureCheckoutSchema, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
+import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
+
+// Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
+// with the bounded streaming read in src/rro_core.js (a missing or lying Content-Length cannot bypass it).
+const PUBLIC_POST_BODY_MAX_BYTES = 64 * 1024;
+const readCappedBody = (request, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) => rroReadCappedBody(request, maxBytes);
+function payloadTooLarge(corsHeaders) {
+  return Response.json(
+    { status: "error", error: "PAYLOAD_TOO_LARGE", max_bytes: PUBLIC_POST_BODY_MAX_BYTES },
+    { status: 413, headers: { ...(corsHeaders || {}), "Cache-Control": "no-store" } }
+  );
+}
+import { rroHandleCheckoutRoutes, rroRenderRroPage, setRroDeps } from "./src/rro_pages.js";
+
 const GOV_UK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json";
 const POSTCODES_IO_URL = "https://api.postcodes.io/postcodes";
 const CLOUDFLARE_DOH_URL = "https://cloudflare-dns.com/dns-query";
@@ -23,21 +38,63 @@ const S137_RATES_BY_FY = {
   "2026/27": 11.60,
 };
 
+function numOr(value, fallback) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = typeof value === "number" ? value : parseFloat(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+class BankHolidaysUnavailableError extends Error {
+  constructor(reason) {
+    super("BANK_HOLIDAYS_UNAVAILABLE: " + reason);
+    this.code = "BANK_HOLIDAYS_UNAVAILABLE";
+  }
+}
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidIsoDate(s) {
+  if (typeof s !== "string" || !ISO_DATE_RE.test(s)) return false;
+  const d = new Date(s + "T00:00:00Z");
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
 async function fetchBankHolidays(division = "england-and-wales") {
-  const resp = await fetch(GOV_UK_BANK_HOLIDAYS_URL, {
-    headers: { "User-Agent": "ParishStatutoryAlmanac/1.1 (+https://parish.technoplusit.co.uk)" },
-  });
-  const data = await resp.json();
+  let resp;
+  try {
+    resp = await fetch(GOV_UK_BANK_HOLIDAYS_URL, {
+      headers: { "User-Agent": "ParishStatutoryAlmanac/1.1 (+https://parish.technoplusit.co.uk)" },
+    });
+  } catch (_) {
+    throw new BankHolidaysUnavailableError("network error");
+  }
+  if (!resp || !resp.ok) {
+    throw new BankHolidaysUnavailableError("upstream status " + (resp ? resp.status : "none"));
+  }
+  let data;
+  try {
+    data = await resp.json();
+  } catch (_) {
+    throw new BankHolidaysUnavailableError("invalid JSON");
+  }
+  if (!data || typeof data !== "object") {
+    throw new BankHolidaysUnavailableError("unexpected shape");
+  }
   const div = data[division] ? division : "england-and-wales";
-  const events = (data[div] && data[div].events) || [];
+  const events = data[div] && Array.isArray(data[div].events) ? data[div].events : [];
   const map = new Map();
   for (const ev of events) {
-    if (ev.date) map.set(ev.date, ev.title || "Bank Holiday");
+    if (ev && typeof ev.date === "string") map.set(ev.date, ev.title || "Bank Holiday");
   }
   return { division: div, holidays: map, source_url: GOV_UK_BANK_HOLIDAYS_URL };
 }
 
 function calcThreeClearDays(meetingIso, holidaysMap) {
+  if (!isValidIsoDate(meetingIso)) {
+    const err = new RangeError("INVALID_MEETING_DATE: expected YYYY-MM-DD");
+    err.code = "INVALID_MEETING_DATE";
+    throw err;
+  }
   const trace = (excludeSaturday) => {
     const clearDays = [];
     const skipped = [];
@@ -62,7 +119,8 @@ function calcThreeClearDays(meetingIso, holidaysMap) {
     while (
       d.getUTCDay() === 0 ||
       (excludeSaturday && d.getUTCDay() === 6) ||
-      holidaysMap.has(d.toISOString().slice(0, 10))
+      holidaysMap.has(d.toISOString().slice(0, 10)) ||
+      d.toISOString().slice(0, 10).endsWith("-12-25")
     ) {
       skipped.push({
         date: d.toISOString().slice(0, 10),
@@ -86,7 +144,26 @@ function calcThreeClearDays(meetingIso, holidaysMap) {
   };
 }
 
+const AGAR_MAX_SCAN_DAYS = 400;
+
 function calcAgarWindow(year, commencementIso, holidaysMap) {
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+    const err = new RangeError("INVALID_YEAR: expected 2000-2100");
+    err.code = "INVALID_YEAR";
+    throw err;
+  }
+  if (commencementIso && !isValidIsoDate(commencementIso)) {
+    const err = new RangeError("INVALID_COMMENCEMENT_DATE: expected YYYY-MM-DD");
+    err.code = "INVALID_COMMENCEMENT_DATE";
+    throw err;
+  }
+  const scanGuard = (n) => {
+    if (n > AGAR_MAX_SCAN_DAYS) {
+      const err = new RangeError("AGAR_SCAN_LIMIT");
+      err.code = "AGAR_SCAN_LIMIT";
+      throw err;
+    }
+  };
   const isWorkingDay = (d) => {
     const dow = d.getUTCDay();
     const iso = d.toISOString().slice(0, 10);
@@ -95,7 +172,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 
   const julyDays = [];
   const jc = new Date(Date.UTC(year, 6, 1));
-  while (julyDays.length < 10) {
+  for (let n = 0; julyDays.length < 10; n++) {
+    scanGuard(n);
     if (isWorkingDay(jc)) julyDays.push(jc.toISOString().slice(0, 10));
     jc.setUTCDate(jc.getUTCDate() + 1);
   }
@@ -108,7 +186,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
   } else {
     const back = new Date(tenthJulyWd + "T00:00:00Z");
     let count = 0;
-    while (count < 30) {
+    for (let n = 0; count < 30; n++) {
+      scanGuard(n);
       if (isWorkingDay(back)) {
         count++;
         if (count === 30) break;
@@ -120,7 +199,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 
   const workingDays = [];
   const cursor = new Date(startDate.getTime());
-  while (workingDays.length < 30) {
+  for (let n = 0; workingDays.length < 30; n++) {
+    scanGuard(n);
     if (isWorkingDay(cursor)) {
       workingDays.push(cursor.toISOString().slice(0, 10));
     }
@@ -131,7 +211,8 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
   const actualEnd = workingDays[workingDays.length - 1];
   const noticeCursor = new Date(actualStart + "T00:00:00Z");
   noticeCursor.setUTCDate(noticeCursor.getUTCDate() - 1);
-  while (!isWorkingDay(noticeCursor)) {
+  for (let n = 0; !isWorkingDay(noticeCursor); n++) {
+    scanGuard(n);
     noticeCursor.setUTCDate(noticeCursor.getUTCDate() - 1);
   }
 
@@ -159,10 +240,10 @@ function calcAgarWindow(year, commencementIso, holidaysMap) {
 }
 
 function calcS137AndGpc(electorsCount, totalSeats = 11, electedCouncillors = 7, clerkCilca = false, proposedSpend = 0, fy = "2026/27") {
-  const electors = Math.max(0, parseInt(electorsCount || 0, 10));
-  const seats = Math.max(1, parseInt(totalSeats || 11, 10));
-  const elected = Math.max(0, Math.min(seats, parseInt(electedCouncillors || 0, 10)));
-  const spend = Math.max(0, parseFloat(proposedSpend || 0));
+  const electors = Math.max(0, Math.trunc(numOr(electorsCount, 0)));
+  const seats = Math.max(1, Math.trunc(numOr(totalSeats, 11)));
+  const elected = Math.max(0, Math.min(seats, Math.trunc(numOr(electedCouncillors, 0))));
+  const spend = Math.max(0, numOr(proposedSpend, 0));
   const validFy = S137_RATES_BY_FY[fy] ? fy : "2026/27";
   const rate = S137_RATES_BY_FY[validFy];
 
@@ -224,8 +305,8 @@ function calcS137AndGpc(electorsCount, totalSeats = 11, electedCouncillors = 7, 
 }
 
 function checkCharity2026Thresholds(grossIncome, grossAssets = 0, structure = "unincorporated_or_cio", fyeIso = "2027-03-31") {
-  const income = Math.max(0, parseFloat(grossIncome || 0));
-  const assets = Math.max(0, parseFloat(grossAssets || 0));
+  const income = Math.max(0, numOr(grossIncome, 0));
+  const assets = Math.max(0, numOr(grossAssets, 0));
   const isCompany = ["charitable_company", "company", "clg"].includes(String(structure || "").toLowerCase());
   const fye = String(fyeIso || "2027-03-31").trim();
   const postSept2026 = fye >= "2026-09-30";
@@ -310,8 +391,8 @@ function calcHmrcBikCap(
   bonusMonth = null,
   bonusAmount = 0
 ) {
-  const cashAnnual = Math.max(0, parseFloat(annualCashSalary || 0));
-  const bikAnnual = Math.max(0, parseFloat(annualBik || 0));
+  const cashAnnual = Math.max(0, numOr(annualCashSalary, 0));
+  const bikAnnual = Math.max(0, numOr(annualBik, 0));
   const periods = [1, 4, 12, 26, 52].includes(parseInt(payPeriods, 10)) ? parseInt(payPeriods, 10) : 12;
 
   let regPeriod = 1;
@@ -332,14 +413,14 @@ function calcHmrcBikCap(
   if (monthlyCashSchedule) {
     if (Array.isArray(monthlyCashSchedule)) {
       periodCashList = Array.from({ length: periods }, (_, idx) =>
-        idx < monthlyCashSchedule.length ? Math.round(Math.max(0, parseFloat(monthlyCashSchedule[idx] || 0)) * 100) / 100 : basePeriodCashPay
+        idx < monthlyCashSchedule.length ? Math.round(Math.max(0, numOr(monthlyCashSchedule[idx], 0)) * 100) / 100 : basePeriodCashPay
       );
       variableCashMode = true;
     } else if (typeof monthlyCashSchedule === "string" && monthlyCashSchedule.trim()) {
       const parts = monthlyCashSchedule.split(",").map((x) => x.trim()).filter(Boolean);
       if (parts.length > 0) {
         periodCashList = Array.from({ length: periods }, (_, idx) =>
-          idx < parts.length ? Math.round(Math.max(0, parseFloat(parts[idx] || 0)) * 100) / 100 : basePeriodCashPay
+          idx < parts.length ? Math.round(Math.max(0, numOr(parts[idx], 0)) * 100) / 100 : basePeriodCashPay
         );
         variableCashMode = true;
       }
@@ -347,7 +428,7 @@ function calcHmrcBikCap(
       for (const [k, v] of Object.entries(monthlyCashSchedule)) {
         const pIdx = parseInt(k, 10);
         if (pIdx >= 1 && pIdx <= periods) {
-          periodCashList[pIdx - 1] = Math.round(Math.max(0, parseFloat(v || 0)) * 100) / 100;
+          periodCashList[pIdx - 1] = Math.round(Math.max(0, numOr(v, 0)) * 100) / 100;
           variableCashMode = true;
         }
       }
@@ -355,7 +436,7 @@ function calcHmrcBikCap(
   }
 
   const bMonth = bonusMonth ? parseInt(bonusMonth, 10) : 0;
-  const bAmt = parseFloat(bonusAmount || 0);
+  const bAmt = numOr(bonusAmount, 0);
   if (bMonth >= 1 && bMonth <= periods && bAmt !== 0) {
     periodCashList[bMonth - 1] = Math.round(Math.max(0, periodCashList[bMonth - 1] + bAmt) * 100) / 100;
     variableCashMode = true;
@@ -364,11 +445,13 @@ function calcHmrcBikCap(
   const effectiveAnnualCashPay = Math.round(periodCashList.reduce((a, b) => a + b, 0) * 100) / 100;
 
   const ukAnnualIncomeTax = (gross) => {
-    let pa = parseFloat(personalAllowance || 12570);
+    let pa = numOr(personalAllowance, 12570);
     if (gross > 100000) pa = Math.max(0, pa - (gross - 100000) / 2);
     const taxable = Math.max(0, gross - pa);
     const basicBand = 37700;
-    const higherLimit = 125140 - parseFloat(personalAllowance || 12570);
+    // HMRC rUK bands on taxable income: basic 0-37,700; higher 37,701-125,140; additional over 125,140.
+    // The PA has fully tapered to 0 by £125,140 gross, so the 45% band starts at £125,140 of taxable income.
+    const higherLimit = 125140;
     if (taxable <= basicBand) return taxable * 0.2;
     if (taxable <= higherLimit) return basicBand * 0.2 + (taxable - basicBand) * 0.4;
     return basicBand * 0.2 + (higherLimit - basicBand) * 0.4 + (taxable - higherLimit) * 0.45;
@@ -881,7 +964,7 @@ const LLMS_TXT = `# UK Parish Council, Village Hall, Charity & Payroll Statutory
 - GET /rro (Interactive UK Property Tribunal Rent Repayment Order & Section 13 Precedent Finder UI)
 - GET /api/rro/search?borough=Camden&region=London (also aliased at /api/rro-search)
 - GET /api/rro-search?format=csv (Download Regional RRO Precedent Pack CSV)
-- POST /api/rro-audit-pdf (Stateless ephemeral private RRO claim/PDF exposure auditor)
+- POST /api/rro-audit-pdf (Private RRO claim check: compares your draft claim with published tribunal decisions; your text is not stored)
 - GET /api/almanac?year=2026&postcode=OX14+4AB&meeting=2026-11-16&domain=gov.uk&electors=1200&seats=11&elected=8&cilca=true&spend=4500&charity_income=35000&charity_assets=150000
 - GET /api/three-clear-days?meeting=2026-11-16
 - GET /api/s137-gpc?electors=1200&seats=11&elected=6&cilca=false&spend=8500&fy=2026/27
@@ -976,7 +1059,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   <main class="container">
     <div class="callout" style="background:#eff6ff;border-left:4px solid #1d4ed8;">
       <strong>NEW NORTH STAR LIVE — <a href="/rro" style="color:#1d4ed8;font-weight:700;">UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder (/rro) &rarr;</a></strong><br/>
-      Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>stateless zero-retention private PDF/claim audit</strong>, or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
+      Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>private claim check</strong> (your text is not stored), or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
     </div>
     <div class="callout">
       <strong>3 Live Statutory &amp; Technical Traps Caught Here:</strong><br/>
@@ -1586,7 +1669,6 @@ function minNum(a, b) {
 }
 
 function auditPrivateRroClaimEdge(payload = {}) {
-  const isolationContextId = crypto.randomUUID();
   let ephemeralBuffer = String(payload.claim_text || payload.raw_text || payload.text || "");
   try {
     const normalized = ephemeralBuffer
@@ -1664,11 +1746,8 @@ function auditPrivateRroClaimEdge(payload = {}) {
 
     return {
       status: "ok",
-      isolation_mode: "stateless-ephemeral-finally-wiped",
-      public_db_mode: "OGL-v3.0-read-only",
-      isolation_context_id: isolationContextId,
-      ephemeral_wiped: true,
-      zero_retention_verified: true,
+      privacy_note: "Your text is used only to produce this response and is not stored.",
+      data_source: "Published GOV.UK First-tier Tribunal (Property Chamber) decisions, Open Government Licence v3.0",
       private_claim_summary: {
         detected_region: region,
         detected_offence_type: offenceType,
@@ -1685,7 +1764,7 @@ function auditPrivateRroClaimEdge(payload = {}) {
   }
 }
 
-const RRO_STATS_CACHE_URL = "https://parish.technoplusit.co.uk/__internal_rro_stats_v2";
+const RRO_STATS_CACHE_URL = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/stats";
 const RRO_ALLOWED_EVENTS = new Set(["search", "calculator_run", "pack_download", "private_audit", "buy_pack_click"]);
 const RRO_EDGE_COUNTERS = {
   daily_totals: {},
@@ -2034,7 +2113,7 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</title>
-  <meta name="description" content="Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Housing Act 2004 s.72/s.95 &amp; Housing and Planning Act 2016 s.40-44. Filter by region, offence, and mitigation factors, or run a zero-retention private claim audit." />
+  <meta name="description" content="Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Housing Act 2004 s.72/s.95 &amp; Housing and Planning Act 2016 s.40-44. Filter by region, offence, and mitigation factors, or check a draft claim privately (your text is not stored)." />
   <style>
     :root { --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #475569; --accent: #0f766e; --border: #e2e8f0; --ok: #15803d; --blue: #1d4ed8; }
     * { box-sizing: border-box; }
@@ -2072,12 +2151,11 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
   <header>
     <div class="container">
       <div class="topnav">
-        <span><strong>TechnoPlusIT UK Statutory Precedent Engine</strong> · OGL v3.0 Read-Only Isolation</span>
+        <span><strong>TechnoPlusIT UK Statutory Precedent Engine</strong> · Source data: GOV.UK, Open Government Licence v3.0</span>
         <div>
           <a href="/">← Back to UK Statutory Almanac</a> &nbsp;|&nbsp;
           <a href="/api/rro-search?format=csv">Download Regional Precedent Pack (CSV)</a> &nbsp;|&nbsp;
-          <a href="/api/rro-search">JSON API</a> &nbsp;|&nbsp;
-          <a href="/rro/stats">Live North Star Stats (Zero-PII)</a>
+          <a href="/api/rro-search">JSON API</a>
         </div>
       </div>
       <h1>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</h1>
@@ -2085,9 +2163,9 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
       <div class="badge-row">
         <span class="badge">281 Real GOV.UK Tribunal PDFs Indexed</span>
         <span class="badge">Read-Only (?mode=ro) OGL v3.0 Reference Index</span>
-        <span class="badge">Stateless Ephemeral Private Claim Auditor (finally: wiped)</span>
+        <span class="badge">Private claim check (text not stored)</span>
         <span class="badge">0 LLM Tokens · Deterministic PDF Ligature Recovery</span>
-        <a href="/rro/stats" class="badge" id="northStarBadge" style="text-decoration:none;background:#0d9488;color:#fff;font-weight:700;">7-Day North Star Gate: Live Zero-PII Stats ↗</a>
+        <span class="badge" id="northStarBadge" style="background:#0d9488;color:#fff;font-weight:700;">Free precedent search</span>
       </div>
     </div>
   </header>
@@ -2227,20 +2305,21 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <button id="calcBtn" type="button">Calculate RRO Award &amp; Generate Scott Schedule</button>
         <a id="calcMdLink" class="btn-link btn-secondary" href="/api/rro-calculate?monthly_rent_gbp=1800&months_unlicensed=12&region=London&format=markdown">Download Scott Schedule (Markdown)</a>
         <a id="calcCsvLink" class="btn-link btn-secondary" href="/api/rro-calculate?monthly_rent_gbp=1800&months_unlicensed=12&region=London&format=csv">Download Scott Schedule (CSV)</a>
-        <a id="buyPackLink" class="btn-link" style="background:#1d4ed8;" href="/api/rro-buy-pack?region=London">Get Complete 281-Decision Regional Defence Dossier Pack (£29)</a>
+        <!--RRO_FORMAL_PACK_CTA_BUTTON-->
       </div>
+      <!--RRO_FORMAL_PACK_CTA_NOTE-->
       <pre id="calcOutput">Click above to compute net eligible rent, empirical direct-award median %, and downloadable Scott Schedule...</pre>
     </div>
 
     <div class="card">
-      <h2>2. Stateless Ephemeral Private RRO Claim / PDF Exposure Auditor (Zero Retention)</h2>
+      <h2>2. Private RRO Claim Check</h2>
       <p style="font-size:0.88rem;color:#475569;margin-top:0;">
-        Paste a draft RRO claim, statement of case, or extracted PDF text below. Processed strictly in an isolated per-request ephemeral buffer and deterministically wiped in a <code>finally:</code> block (<code>ephemeral_wiped: true</code>) against the read-only OGL v3.0 precedent index.
+        Paste a draft RRO claim, statement of case, or text copied from a PDF below. We compare it with published tribunal decisions and show comparable awards. Your text is used only to produce the result and is not stored.
       </p>
-      <label for="privateText">Private RRO Claim / Statement of Case Text (Wiped Immediately After Response)</label>
+      <label for="privateText">Your draft claim or statement of case (not stored)</label>
       <textarea id="privateText">Case Reference: Draft Claim (Ealing London W3). Application for a Rent Repayment Order under section 95(1) Housing Act 2004 (Selective Licensing) and section 72(1) HMO. Total rent paid and claimed for 12 months is £21,000.00 inclusive of utilities and council tax. The landlord relied upon a managing agent, had no previous convictions, and applied for a licence once notified.</textarea>
       <div class="btn-row">
-        <button id="auditBtn" type="button">Run Stateless Ephemeral RRO Exposure Audit</button>
+        <button id="auditBtn" type="button">Check my claim</button>
       </div>
       <pre id="auditOutput">Click above to benchmark private claim exposure against read-only OGL v3.0 rulings...</pre>
     </div>
@@ -2312,16 +2391,8 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
     document.getElementById("region").addEventListener("change", runRroSearch);
     document.getElementById("offence").addEventListener("change", runRroSearch);
     document.getElementById("mitigation").addEventListener("change", runRroSearch);
-    async function refreshNorthStarBadge() {
-      try {
-        const r = await fetch("/api/rro/stats");
-        const s = await r.json();
-        const el = document.getElementById("northStarBadge");
-        if (el && s && s.status === "ok") {
-          el.textContent = "7-Day North Star Gate: " + s.total_searches + "/100 Searches · " + s.total_pack_downloads + "/10 Pack Downloads · " + s.total_private_audits + " Audits (Zero-PII JSON ↗)";
-        }
-      } catch (_) {}
-    }
+    // Usage counters are private (/api/rro/stats needs RRO_TELEMETRY_TOKEN), so the page shows no live counts.
+    async function refreshNorthStarBadge() {}
 
     async function runRroCalc() {
       const monthly_rent_gbp = document.getElementById("calcRent").value;
@@ -2334,10 +2405,46 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
       const qs = new URLSearchParams({ monthly_rent_gbp, months_unlicensed, universal_credit_housing_gbp, utilities_included_monthly_gbp, region, party_role, mitigation_factors: mitigation });
       document.getElementById("calcMdLink").href = "/api/rro-calculate?" + qs.toString() + "&format=markdown";
       document.getElementById("calcCsvLink").href = "/api/rro-calculate?" + qs.toString() + "&format=csv";
-      document.getElementById("buyPackLink").href = "/api/rro-buy-pack?region=" + encodeURIComponent(region) + "&role=" + encodeURIComponent(party_role);
       const resp = await fetch("/api/rro-calculate?" + qs.toString());
       const data = await resp.json();
       document.getElementById("calcOutput").textContent = JSON.stringify(data.calculation, null, 2) + "\n\n" + data.schedule_markdown;
+    }
+    async function startFormalPackCheckout() {
+      const btn = document.getElementById("formalPackBtn");
+      const note = document.getElementById("formalPackNote");
+      const body = {
+        monthly_rent_gbp: document.getElementById("calcRent").value,
+        months_unlicensed: document.getElementById("calcMonths").value,
+        universal_credit_housing_gbp: document.getElementById("calcUc").value,
+        utilities_included_monthly_gbp: document.getElementById("calcUtil").value,
+        region: document.getElementById("calcRegion").value,
+        party_role: document.getElementById("calcRole").value,
+        mitigation_factors: (document.getElementById("mitigation") || {}).value || ""
+      };
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Opening secure Stripe Checkout…";
+      try {
+        const resp = await fetch("/api/rro/checkout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok && data.url && data.url.indexOf("https://checkout.stripe.com/") === 0) {
+          window.location.assign(data.url);
+          return;
+        }
+        note.textContent = data.error === "RATE_LIMITED" ? "Too many checkout attempts — please wait a few minutes and try again." : "Checkout is temporarily unavailable. Please try again shortly.";
+      } catch (e) {
+        note.textContent = "Checkout is temporarily unavailable. Please try again shortly.";
+      }
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+    const formalPackBtnEl = document.getElementById("formalPackBtn");
+    if (formalPackBtnEl) {
+      formalPackBtnEl.addEventListener("click", startFormalPackCheckout);
+    }
+    if (new URLSearchParams(window.location.search).get("checkout") === "cancelled") {
+      const n = document.getElementById("formalPackNote");
+      if (n) n.textContent = "Checkout cancelled — no payment was taken. You can export the Formal Tribunal Appeal Pack any time for £24.";
     }
     const calcBtnEl = document.getElementById("calcBtn");
     if (calcBtnEl) {
@@ -2398,7 +2505,7 @@ const MCP_TOOLS_MANIFEST = [
   },
   {
     name: "audit_private_rro_claim",
-    description: "Stateless ephemeral audit of an RRO application or decision excerpt against the 281-decision GOV.UK tribunal corpus.",
+    description: "Check an RRO application or decision excerpt against the 281 published GOV.UK tribunal decisions. Input text is not stored.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2542,8 +2649,13 @@ async function handleMcpRpcMessage(msg, isInternal) {
   };
 }
 
+// RRO £24 Stripe Checkout lives in src/rro_core.js, src/rro_checkout.js and src/rro_pages.js.
+
+// /rro/stats is token-gated, so it is not advertised in the public sitemap.
+const RRO_PUBLIC_SITEMAP_XML = RRO_SITEMAP_XML.replace(/\s*<url>\s*<loc>https:\/\/parish\.technoplusit\.co\.uk\/rro\/stats<\/loc>[\s\S]*?<\/url>/, "");
+
 export default {
-  async fetch(request) {
+  async fetch(request, env = {}, ctx) {
     const url = new URL(request.url);
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
@@ -2557,12 +2669,17 @@ export default {
     };
     const htmlHeaders = {
       ...corsHeaders,
-      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com",
       "Content-Type": "text/html; charset=utf-8",
     };
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    const rroCheckoutResponse = await rroHandleCheckoutRoutes(request, env || {}, url);
+    if (rroCheckoutResponse) {
+      return rroCheckoutResponse;
     }
 
     const isInternal = ["1", "true", "yes"].includes(
@@ -2590,9 +2707,11 @@ export default {
         );
       }
       if (request.method === "POST") {
+        const mcpBody = await readCappedBody(request);
+        if (!mcpBody.ok) return payloadTooLarge(corsHeaders);
         let payload;
         try {
-          payload = await request.json();
+          payload = JSON.parse(mcpBody.text);
         } catch (_) {
           return Response.json(
             { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error: invalid JSON" } },
@@ -2612,7 +2731,7 @@ export default {
     }
 
     if (url.pathname === "/sitemap.xml") {
-      return new Response(RRO_SITEMAP_XML, {
+      return new Response(RRO_PUBLIC_SITEMAP_XML, {
         headers: { ...corsHeaders, "Content-Type": "application/xml; charset=utf-8" },
       });
     }
@@ -2630,9 +2749,11 @@ export default {
     }
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
-      return new Response(RRO_HTML_PAGE, {
-        headers: htmlHeaders,
-      });
+      const rroPage = await rroRenderRroPage(request, env || {}, url);
+      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...htmlHeaders, ...rroPage.headers });
+      for (const c of rroPage.cookies || []) rroHeaders.append("Set-Cookie", c);
+      if (rroPage.redirect) return new Response(null, { status: 302, headers: rroHeaders });
+      return new Response(rroPage.html, { headers: rroHeaders });
     }
 
     if (
@@ -2642,6 +2763,12 @@ export default {
       url.pathname === "/api/rro/stats/" ||
       url.pathname === "/api/rro-stats"
     ) {
+      if (!(await rroTelemetryAuthorised(request, env))) {
+        return Response.json(
+          { status: "error", error: "UNAUTHORIZED" },
+          { status: 401, headers: { "Cache-Control": "no-store", "WWW-Authenticate": "Bearer", "X-Content-Type-Options": "nosniff" } }
+        );
+      }
       const statsPayload = await getRroEdgeStats();
       return Response.json(statsPayload, {
         headers: {
@@ -2804,7 +2931,9 @@ export default {
         claimed_gbp: url.searchParams.get("claimed_gbp") || "",
       };
       if (request.method === "POST") {
-        const rawBody = await request.text();
+        const capped = await readCappedBody(request);
+        if (!capped.ok) return payloadTooLarge(corsHeaders);
+        const rawBody = capped.text;
         try {
           const parsed = JSON.parse(rawBody);
           payload = { ...payload, ...parsed };
@@ -2827,7 +2956,12 @@ export default {
       return Response.json(AGENT_JSON, { headers: corsHeaders });
     }
 
-    if (url.pathname === "/api/health" || url.pathname === "/health" || url.pathname === "/healthz") {
+    if (url.pathname === "/health" || url.pathname === "/healthz") {
+      // Liveness probes stay minimal; public discovery metadata lives on /api/health, /mcp and agent.json.
+      return Response.json({ status: "ok" }, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    if (url.pathname === "/api/health") {
       return Response.json(
         {
           status: "ok",
@@ -2863,7 +2997,24 @@ export default {
     if (url.pathname === "/api/three-clear-days") {
       const meeting = url.searchParams.get("meeting") || "2026-11-16";
       const division = url.searchParams.get("division") || "england-and-wales";
-      const bh = await fetchBankHolidays(division);
+      if (!isValidIsoDate(meeting)) {
+        return Response.json(
+          { status: "error", error: "INVALID_MEETING_DATE", expected: "YYYY-MM-DD" },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+      let bh;
+      try {
+        bh = await fetchBankHolidays(division);
+      } catch (e) {
+        if (e && e.code === "BANK_HOLIDAYS_UNAVAILABLE") {
+          return Response.json(
+            { status: "error", error: "BANK_HOLIDAYS_UNAVAILABLE" },
+            { status: 502, headers: corsHeaders }
+          );
+        }
+        throw e;
+      }
       return Response.json(
         {
           status: "ok",
@@ -2919,7 +3070,9 @@ export default {
       let rawText = url.searchParams.get("text") || url.searchParams.get("raw_text") || "";
       let docType = url.searchParams.get("document_type") || "auto";
       if (!rawText && request.method === "POST") {
-        const bodyText = await request.text();
+        const clauseBody = await readCappedBody(request);
+        if (!clauseBody.ok) return payloadTooLarge(corsHeaders);
+        const bodyText = clauseBody.text;
         try {
           const parsed = JSON.parse(bodyText);
           rawText = parsed.raw_text || parsed.text || "";
@@ -2945,7 +3098,9 @@ export default {
       let rawPayload = url.searchParams.get("schema");
       const strategy = url.searchParams.get("strategy") || "move_default_to_prefill";
       if (!rawPayload && request.method === "POST") {
-        rawPayload = await request.text();
+        const capped = await readCappedBody(request);
+        if (!capped.ok) return payloadTooLarge(corsHeaders);
+        rawPayload = capped.text;
       }
       if (!rawPayload) {
         rawPayload = JSON.stringify({
@@ -2983,11 +3138,25 @@ export default {
       const charityIncome = url.searchParams.get("charity_income") || "35000";
       const charityAssets = url.searchParams.get("charity_assets") || "150000";
 
-      const [bh, parishLookup, jpagAudit] = await Promise.all([
-        fetchBankHolidays(division),
-        resolvePostcode(postcode),
-        auditDomainJpag(domain),
-      ]);
+      if (!isValidIsoDate(meeting) || (commencement && !isValidIsoDate(commencement)) || !Number.isInteger(year) || year < 2000 || year > 2100) {
+        return Response.json(
+          { status: "error", error: "INVALID_DATE_INPUT", expected: "meeting/commencement YYYY-MM-DD, year 2000-2100" },
+          { status: 400, headers: corsHeaders }
+        );
+      }
+      let bh, parishLookup, jpagAudit;
+      try {
+        [bh, parishLookup, jpagAudit] = await Promise.all([
+          fetchBankHolidays(division),
+          resolvePostcode(postcode),
+          auditDomainJpag(domain),
+        ]);
+      } catch (e) {
+        if (e && e.code === "BANK_HOLIDAYS_UNAVAILABLE") {
+          return Response.json({ status: "error", error: "BANK_HOLIDAYS_UNAVAILABLE" }, { status: 502, headers: corsHeaders });
+        }
+        throw e;
+      }
 
       return Response.json(
         {
@@ -3015,11 +3184,11 @@ export default {
           available_endpoints: [
             "/mcp",
             "/api/health",
-            "/api/rro/stats",
             "/api/rro/search",
             "/api/rro/calculate",
             "/api/rro/audit-pdf",
-            "/api/rro/buy-pack",
+            "/api/rro/checkout",
+            "/api/rro/telemetry",
             "/api/almanac",
             "/api/three-clear-days",
             "/api/s137-gpc",
@@ -3044,4 +3213,18 @@ export default {
       { status: 404, headers: corsHeaders }
     );
   },
+
+  // T3: MANDATORY hourly cron ("0 * * * *", registered and verified by deploy/build_cf_execute.mjs) runs the full
+  // retention purge: ip_hash NULLed after 48h, rate-limit rows deleted after 1h. The webhook also purges (bounded).
+  async scheduled(_event, env = {}, ctx) {
+    if (!env || !env.RRO_CHECKOUT_DB) return;
+    const job = (async () => {
+      await rroEnsureCheckoutSchema(env.RRO_CHECKOUT_DB);
+      await rroPurgeIpHashes(env.RRO_CHECKOUT_DB);
+    })();
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(job);
+    else await job;
+  },
 };
+
+setRroDeps({ RRO_HTML_PAGE, RRO_PRECEDENTS, calculateRroAwardEdge, escapeHtml, exportRroPrecedentsCsv, searchRroPrecedentsEdge });

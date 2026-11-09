@@ -18,8 +18,19 @@ Live Streamable HTTP MCP Endpoint (`JSON-RPC 2.0`): **https://parish.technoplusi
 6. **UK Scanned Legal Deed & Clause Extractor (`/api/pdf-clause-extract`)** — Section 106 obligations, Companies House MR01 negative pledges, and Charity Independent Examiner reports.
 7. **Apify-to-MCP `input_schema.json` Silent Bug Linter & Auto-Fixer (`/api/apify-mcp-lint`)** (`required` + `default` silent drop protection & `prefill` enforcement)
 
+
+## Export Formal Tribunal Appeal Pack — £24 (Stripe Checkout)
+The `/rro` calculator offers **"Export Formal Tribunal Appeal Pack — £24"** via a hosted Stripe Checkout Session redirect. The offer is shown only when checkout is fully configured; otherwise the calculator works with no paid CTA.
+Config, routes, fail-closed behaviour and deploy steps: [`deploy/RRO_STRIPE_CHECKOUT.md`](deploy/RRO_STRIPE_CHECKOUT.md).
+
 ## Running Tests
 
 ```bash
+# Worker + £24 RRO Stripe Checkout (Node 22+, no network: Stripe is mocked, D1 is an in-memory node:sqlite)
+node --test tests/*.mjs
+
+# Python almanac tests
 pytest -v tests/test_parish_almanac.py
 ```
+
+The Node suite needs no secrets: it uses fake `sk_test_`/`whsec_` values, a fake preview secret and a fake IP pepper defined in the test file. It covers checkout creation (test-mode label, deterministic Idempotency-Key), the fail-closed live gate, signed and expiring preview links and cookies, the webhook signature and livemode check, D1-first session lookups and rate limits, IP-hash retention, and the generic `/rro/pack/success` error page. Three Python tests currently fail on `main` as well (sibling-module imports); they are not caused by the checkout work.
