@@ -29,6 +29,16 @@ const RRO_PUBLIC_ORIGIN = "https://parish.technoplusit.co.uk";
 const RRO_CHECKOUT_RATE_LIMIT = { max_starts: 5, window_minutes: 10 };
 const RRO_LOOKUP_RATE_LIMIT = { max_hits: 30, window_minutes: 10 };
 const RRO_PAID_CACHE_TTL_MS = 10 * 60 * 1000;
+// P2: a "not paid" (or Stripe-404) verdict for a known session is cached for 30 s, so a polling or
+// hostile client cannot make one Stripe call per request. A webhook-recorded 'paid' row bypasses it.
+const RRO_NOT_PAID_CACHE_TTL_MS = 30 * 1000;
+// P2: global cap on Stripe session lookups (all IPs together), D1-backed so it holds across colos.
+const RRO_STRIPE_LOOKUP_GLOBAL_CAP = { max_hits: 300, window_minutes: 10 };
+// P15: per-IP limit on the public search + calculate API (GET and POST, every path alias), one shared bucket.
+// The colo counter (isolate Map + caches.default) is exact per colo and costs no D1 write; every
+// flush_every-th admitted hit in a colo adds flush_every to a global D1 counter, so a normal visitor
+// (< flush_every requests per window) causes zero D1 writes.
+const RRO_PUBLIC_RATE_LIMIT = { max_hits: 120, window_minutes: 10, flush_every: 10 };
 const RRO_IP_HASH_RETENTION_HOURS = 48;
 const RRO_PREVIEW_COOKIE = "rro_preview";
 const RRO_TEST_MODE_LABEL = "TEST MODE – no real payment; do not enter real card details";
@@ -49,6 +59,10 @@ const RRO_CHECKOUT_SCHEMA = [
   "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits ON rro_rate_hits(bucket, ip_hash, created_at_utc)",
   // TC2: the retention purge filters on created_at_utc alone; without this it is a full table scan.
   "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits_created_at ON rro_rate_hits(created_at_utc)",
+  // P2/P3/P15: one aggregate row per (bucket, key, fixed window) instead of one row per hit.
+  // key_hash is the peppered daily ip_hash, or the literal 'global'. Rows are deleted after 1h.
+  "CREATE TABLE IF NOT EXISTS rro_rate_counters (bucket TEXT NOT NULL, key_hash TEXT NOT NULL, window_start_utc TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (bucket, key_hash, window_start_utc))",
+  "CREATE INDEX IF NOT EXISTS ix_rro_rate_counters_window ON rro_rate_counters(window_start_utc)",
 ];
 // One DDL batch per isolate: a module-level promise (a D1 binding wrapper is not a stable WeakSet key).
 // A failed batch clears the promise so the next request retries.
@@ -106,16 +120,38 @@ const RRO_LOOKUP_LIMITER_MAX_KEYS = 5000;
 // Per-key in-flight chain: checks for one key run one after another inside an isolate, and the count is
 // re-read after the cache await, so concurrent requests cannot all pass on the same pre-await count.
 const RRO_LOOKUP_INFLIGHT = new Map();
+function rroCacheRateLimitKey(bucket, ipHash, windowIdx) {
+  return RRO_INTERNAL_CACHE_PREFIX + "rl/" + encodeURIComponent(bucket) + "/" + encodeURIComponent(ipHash) + "/" + windowIdx;
+}
 function rroCacheRateLimitHit(bucket, ipHash, max, windowMinutes, nowMs) {
+  return rroCacheRateLimitCount(bucket, ipHash, max, windowMinutes, nowMs).then((r) => r.allowed);
+}
+// Same limiter, but reports the admitted count (1..max) so callers can flush to D1 every N hits.
+function rroCacheRateLimitCount(bucket, ipHash, max, windowMinutes, nowMs) {
   const now = typeof nowMs === "number" ? nowMs : Date.now();
   const windowMs = windowMinutes * 60000;
   const windowIdx = Math.floor(now / windowMs);
-  const key = RRO_INTERNAL_CACHE_PREFIX + "rl/" + encodeURIComponent(bucket) + "/" + encodeURIComponent(ipHash) + "/" + windowIdx;
+  const key = rroCacheRateLimitKey(bucket, ipHash, windowIdx);
   const prev = RRO_LOOKUP_INFLIGHT.get(key) || Promise.resolve();
   const run = prev.catch(() => {}).then(() => rroCacheRateLimitStep(key, max, windowIdx, windowMs, now));
   RRO_LOOKUP_INFLIGHT.set(key, run);
   run.finally(() => { if (RRO_LOOKUP_INFLIGHT.get(key) === run) RRO_LOOKUP_INFLIGHT.delete(key); }).catch(() => {});
   return run;
+}
+// Mark a key as exhausted for the rest of its window in this isolate and colo (after the global D1 count says so).
+async function rroCacheRateLimitBlock(bucket, ipHash, max, windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const windowMs = windowMinutes * 60000;
+  const windowIdx = Math.floor(now / windowMs);
+  const key = rroCacheRateLimitKey(bucket, ipHash, windowIdx);
+  const exp = (windowIdx + 1) * windowMs;
+  RRO_LOOKUP_LIMITER.set(key, { n: max, exp });
+  const cache = typeof caches !== "undefined" && caches && caches.default ? caches.default : null;
+  if (cache) {
+    try {
+      await cache.put(key, new Response(String(max), { headers: { "Cache-Control": "max-age=" + Math.max(1, Math.ceil((exp - now) / 1000)) } }));
+    } catch (_) {}
+  }
 }
 
 async function rroCacheRateLimitStep(key, max, windowIdx, windowMs, now) {
@@ -134,7 +170,7 @@ async function rroCacheRateLimitStep(key, max, windowIdx, windowMs, now) {
   // Re-read the isolate counter after the await.
   const local = RRO_LOOKUP_LIMITER.get(key);
   const count = Math.max(local && local.exp > now ? local.n : 0, shared);
-  if (count >= max) return false;
+  if (count >= max) return { allowed: false, count };
   const exp = (windowIdx + 1) * windowMs;
   RRO_LOOKUP_LIMITER.set(key, { n: count + 1, exp });
   if (cache) {
@@ -143,7 +179,70 @@ async function rroCacheRateLimitStep(key, max, windowIdx, windowMs, now) {
       await cache.put(key, new Response(String(count + 1), { headers: { "Cache-Control": "max-age=" + ttl } }));
     } catch (_) {}
   }
-  return true;
+  return { allowed: true, count: count + 1 };
+}
+
+// ---- P2/P3/P15: D1-backed fixed-window counters (table rro_rate_counters, migration 0003) ----
+function rroWindowStartIso(windowMinutes, nowMs) {
+  const w = windowMinutes * 60000;
+  return new Date(Math.floor(nowMs / w) * w).toISOString();
+}
+function rroRetryAfterSec(windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const w = windowMinutes * 60000;
+  return Math.max(1, Math.ceil(((Math.floor(now / w) + 1) * w - now) / 1000));
+}
+// Exact global counter: ONE conditional upsert. Allowed => the row is created or incremented (1 row
+// written). Over the limit => the DO UPDATE ... WHERE fails, nothing is written and no row is returned.
+async function rroD1CounterHit(db, bucket, keyHash, max, windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const row = await db
+    .prepare(
+      "INSERT INTO rro_rate_counters (bucket, key_hash, window_start_utc, n) VALUES (?1, ?2, ?3, 1) " +
+        "ON CONFLICT(bucket, key_hash, window_start_utc) DO UPDATE SET n = n + 1 WHERE n < ?4 RETURNING n"
+    )
+    .bind(bucket, keyHash, rroWindowStartIso(windowMinutes, now), max)
+    .first();
+  return Boolean(row);
+}
+// Batched global counter: adds `delta` in one upsert and returns the new window total.
+async function rroD1CounterAdd(db, bucket, keyHash, delta, windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const row = await db
+    .prepare(
+      "INSERT INTO rro_rate_counters (bucket, key_hash, window_start_utc, n) VALUES (?1, ?2, ?3, ?4) " +
+        "ON CONFLICT(bucket, key_hash, window_start_utc) DO UPDATE SET n = n + excluded.n RETURNING n"
+    )
+    .bind(bucket, keyHash, rroWindowStartIso(windowMinutes, now), delta)
+    .first();
+  return Number((row && row.n) || 0);
+}
+
+// P15: per-IP limit for the public search/calculate API. Returns { allowed, retryAfterSec }.
+// Fails OPEN (allowed, logged) if the pepper is missing or D1 errors: these are free public tools over
+// public OGL data, so an infrastructure fault must not take them offline. The colo limit still applies.
+async function rroPublicRateLimit(request, env, bucket, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const lim = RRO_PUBLIC_RATE_LIMIT;
+  const ipHash = await rroIpHash(request, env || {});
+  if (!ipHash) return { allowed: true, skipped: "no_pepper" };
+  const local = await rroCacheRateLimitCount(bucket, ipHash, lim.max_hits, lim.window_minutes, now);
+  const limited = { allowed: false, retryAfterSec: rroRetryAfterSec(lim.window_minutes, now) };
+  if (!local.allowed) return limited;
+  const db = env && env.RRO_CHECKOUT_DB;
+  if (db && local.count % lim.flush_every === 0) {
+    try {
+      await rroEnsureCheckoutSchema(db);
+      const total = await rroD1CounterAdd(db, bucket, ipHash, lim.flush_every, lim.window_minutes, now);
+      if (total > lim.max_hits) {
+        await rroCacheRateLimitBlock(bucket, ipHash, lim.max_hits, lim.window_minutes, now);
+        return limited;
+      }
+    } catch (err) {
+      console.log(JSON.stringify({ event: "rro_public_rate_limit_d1_error", error: String((err && err.message) || err).slice(0, 200) }));
+    }
+  }
+  return { allowed: true };
 }
 
 // Bounded body read: refuses a declared Content-Length over maxBytes, then streams the body and cancels
@@ -171,11 +270,89 @@ async function rroReadCappedBody(request, maxBytes) {
   return { ok: true, text: new TextDecoder().decode(buf) };
 }
 
+// P2: per-isolate + per-colo "not paid" verdict cache (30 s), keyed by session id. Bounded.
+const RRO_NOT_PAID_CACHE = new Map();
+const RRO_NOT_PAID_CACHE_URL = RRO_INTERNAL_CACHE_PREFIX + "notpaid/";
+async function rroNotPaidCacheGet(sessionId, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const hit = RRO_NOT_PAID_CACHE.get(sessionId);
+  if (hit && hit.exp > now) return hit.verdict;
+  if (hit) RRO_NOT_PAID_CACHE.delete(sessionId);
+  try {
+    if (typeof caches !== "undefined" && caches && caches.default) {
+      const r = await caches.default.match(RRO_NOT_PAID_CACHE_URL + encodeURIComponent(sessionId));
+      if (r) {
+        const v = await r.json();
+        if (v && typeof v.status === "number" && typeof v.error === "string" && Number(v.exp) > now) return { status: v.status, error: v.error };
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+async function rroNotPaidCachePut(sessionId, verdict, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const exp = now + RRO_NOT_PAID_CACHE_TTL_MS;
+  const v = { status: verdict.status, error: verdict.error };
+  if (RRO_NOT_PAID_CACHE.size >= 1000) RRO_NOT_PAID_CACHE.delete(RRO_NOT_PAID_CACHE.keys().next().value);
+  RRO_NOT_PAID_CACHE.set(sessionId, { exp, verdict: v });
+  try {
+    if (typeof caches !== "undefined" && caches && caches.default) {
+      await caches.default.put(
+        RRO_NOT_PAID_CACHE_URL + encodeURIComponent(sessionId),
+        new Response(JSON.stringify({ ...v, exp }), { headers: { "Content-Type": "application/json", "Cache-Control": "max-age=" + Math.ceil(RRO_NOT_PAID_CACHE_TTL_MS / 1000) } })
+      );
+    }
+  } catch (_) {}
+}
+function rroNotPaidCacheDelete(sessionId) {
+  RRO_NOT_PAID_CACHE.delete(sessionId);
+}
+
 // Test hook: forget per-isolate state (schema promise, lookup counters) between in-process test cases.
 function rroResetIsolateStateForTests() {
   RRO_CHECKOUT_SCHEMA_PROMISE = null;
   RRO_LOOKUP_LIMITER.clear();
   RRO_LOOKUP_INFLIGHT.clear();
+  RRO_NOT_PAID_CACHE.clear();
+}
+
+// P39 / P24: Content-Security-Policy for HTML pages. Every inline executable <script> (no src, not a JSON
+// data block) is allowed by its exact sha256 hash, computed from the HTML actually served, so there is no
+// 'unsafe-inline' for scripts and an injected <script> or on*= handler will not run. Memoised per script text.
+const RRO_CSP_HASH_MEMO = new Map();
+const RRO_INLINE_SCRIPT_RE = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi;
+async function rroInlineScriptHashes(html) {
+  const out = [];
+  for (const m of String(html || "").matchAll(RRO_INLINE_SCRIPT_RE)) {
+    const attrs = String(m[1] || "");
+    if (/\bsrc\s*=/i.test(attrs)) continue;
+    const t = /\btype\s*=\s*["']?([^"'\s>]+)/i.exec(attrs);
+    if (t && !/^(text|application)\/(java|ecma)script$|^module$/i.test(t[1])) continue; // e.g. application/ld+json: data, not executed
+    const text = m[2];
+    let h = RRO_CSP_HASH_MEMO.get(text);
+    if (!h) {
+      const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+      h = "'sha256-" + btoa(String.fromCharCode(...new Uint8Array(d))) + "'";
+      if (RRO_CSP_HASH_MEMO.size < 64) RRO_CSP_HASH_MEMO.set(text, h);
+    }
+    if (!out.includes(h)) out.push(h);
+  }
+  return out;
+}
+async function rroHtmlCsp(html) {
+  const hashes = await rroInlineScriptHashes(html);
+  return [
+    "default-src 'self'",
+    "script-src 'self'" + (hashes.length ? " " + hashes.join(" ") : ""),
+    "script-src-attr 'none'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self' https://checkout.stripe.com",
+  ].join("; ");
 }
 
 function rroJson(body, status, extraHeaders) {
@@ -218,6 +395,8 @@ async function rroPurgeIpHashes(db, nowMs) {
   const hitCutoff = new Date(now - 3600000).toISOString();
   await db.prepare("UPDATE rro_checkout_events SET ip_hash = NULL WHERE ip_hash IS NOT NULL AND created_at_utc < ?1").bind(eventCutoff).run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
+  // P15: aggregate counter rows are only needed for their 10-minute window.
+  await db.prepare("DELETE FROM rro_rate_counters WHERE window_start_utc < ?1").bind(hitCutoff).run();
 }
 
 // Opportunistic retention on the webhook write path: at most `limit` rows per table per call.
@@ -231,6 +410,10 @@ async function rroPurgeIpHashesBounded(db, limit, nowMs) {
     .bind(eventCutoff, n)
     .run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE id IN (SELECT id FROM rro_rate_hits WHERE created_at_utc < ?1 LIMIT ?2)").bind(hitCutoff, n).run();
+  await db
+    .prepare("DELETE FROM rro_rate_counters WHERE rowid IN (SELECT rowid FROM rro_rate_counters WHERE window_start_utc < ?1 LIMIT ?2)")
+    .bind(hitCutoff, n)
+    .run();
 }
 
 // Atomic check-and-reserve limiter: ONE conditional INSERT ... SELECT ... WHERE count < max, so two
@@ -341,8 +524,11 @@ function rroCleanInputs(raw) {
     if (!Number.isFinite(n)) return d;
     return Math.max(lo, Math.min(hi, Math.round(n * 100) / 100));
   };
+  // P39: same region rule as the calculator (worker.js rroCalcRegion): allowlisted in any case; missing ->
+  // London; anything else -> "all". Before this, an unknown region was "all" in the calculator but "London" here.
   const regions = ["London", "Southern", "Midlands", "Northern", "Eastern"];
-  const region = regions.includes(String(src.region)) ? String(src.region) : "London";
+  const rawRegion = String(src.region ?? "London").trim().toLowerCase();
+  const region = regions.find((r) => r.toLowerCase() === rawRegion) || "all";
   const role = String(src.party_role || src.role || "").toLowerCase().includes("tenant") ? "tenant_claim" : "landlord_defence";
   const mitigation = String(src.mitigation_factors || src.mitigation || "")
     .split(/[,;]/)
@@ -447,6 +633,9 @@ export {
   RRO_CHECKOUT_RATE_LIMIT,
   RRO_LOOKUP_RATE_LIMIT,
   RRO_PAID_CACHE_TTL_MS,
+  RRO_NOT_PAID_CACHE_TTL_MS,
+  RRO_STRIPE_LOOKUP_GLOBAL_CAP,
+  RRO_PUBLIC_RATE_LIMIT,
   RRO_IP_HASH_RETENTION_HOURS,
   RRO_PREVIEW_COOKIE,
   RRO_TEST_MODE_LABEL,
@@ -457,7 +646,19 @@ export {
   RRO_INTERNAL_CACHE_PREFIX,
   RRO_OPPORTUNISTIC_PURGE_LIMIT,
   rroCacheRateLimitHit,
+  rroCacheRateLimitCount,
+  rroCacheRateLimitBlock,
+  rroWindowStartIso,
+  rroRetryAfterSec,
+  rroD1CounterHit,
+  rroD1CounterAdd,
+  rroPublicRateLimit,
+  rroNotPaidCacheGet,
+  rroNotPaidCachePut,
+  rroNotPaidCacheDelete,
   rroReadCappedBody,
+  rroInlineScriptHashes,
+  rroHtmlCsp,
   rroPurgeIpHashesBounded,
   rroResetIsolateStateForTests,
   rroStripeMode,

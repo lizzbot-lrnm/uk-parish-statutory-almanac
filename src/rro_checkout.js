@@ -92,7 +92,9 @@ async function rroHandleCheckoutCreate(request, env) {
   const idemKey = await rroCheckoutIdempotencyKey(mode.mode, ipHash, rroBrowserNonce(request), inputs);
   const res = await rroStripeRequest(env, "POST", "/v1/checkout/sessions", form, idemKey);
   if (!res.ok || !res.data || typeof res.data.url !== "string" || !res.data.id) {
-    return rroJson({ status: "error", error: "STRIPE_SESSION_CREATE_FAILED" }, 502);
+    // P16: the upstream failure detail goes to the log only (no Stripe status, message or body to the client).
+    console.log(JSON.stringify({ event: "rro_checkout_error", error: "STRIPE_SESSION_CREATE_FAILED", upstream_status: Number(res.status) || 0 }));
+    return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 502);
   }
   let checkoutUrl;
   try {
@@ -101,7 +103,8 @@ async function rroHandleCheckoutCreate(request, env) {
     checkoutUrl = null;
   }
   if (!checkoutUrl || checkoutUrl.protocol !== "https:" || checkoutUrl.hostname !== "checkout.stripe.com") {
-    return rroJson({ status: "error", error: "STRIPE_SESSION_URL_UNEXPECTED" }, 502);
+    console.log(JSON.stringify({ event: "rro_checkout_error", error: "STRIPE_SESSION_URL_UNEXPECTED" }));
+    return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 502);
   }
 
   await db

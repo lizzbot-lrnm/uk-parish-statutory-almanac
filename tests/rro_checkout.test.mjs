@@ -178,7 +178,7 @@ test("checkout refuses a non-Stripe redirect url (no open redirect); failure bod
   assert.equal(r.status, 502);
   mockStripe(() => jsonResp({ error: { message: "x" } }, 401));
   const r2 = await worker.fetch(checkoutReq(), env());
-  assert.deepEqual(await r2.json(), { status: "error", error: "STRIPE_SESSION_CREATE_FAILED" });
+  assert.deepEqual(await r2.json(), { status: "error", error: "CHECKOUT_UNAVAILABLE" }); // P16: no upstream detail
 });
 
 test("checkout start is rate-limited per hashed IP, slot reserved before Stripe (failures count)", async () => {
@@ -292,7 +292,7 @@ test("T2: unknown session_id -> 404 on /api/rro/pack and /rro/pack/success with 
   const e = env();
   const r1 = await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_UNKNOWNSESSION00001"), e);
   assert.equal(r1.status, 404);
-  assert.equal((await r1.json()).error, "SESSION_NOT_FOUND");
+  assert.equal((await r1.json()).error, "NOT_FOUND"); // P16: generic public code
   const r2 = await worker.fetch(getReq("/rro/pack/success?session_id=cs_live_UNKNOWNSESSION00002"), env({ STRIPE_SECRET_KEY: FAKE_LIVE_KEY, RRO_STRIPE_LIVE_ENABLED: "true" }));
   assert.equal(r2.status, 404);
   assert.equal(stripeCalls.length, 0);
@@ -331,8 +331,11 @@ test("pack download requires a verified paid session and returns the formal pack
   mockStripe(() => jsonResp({ ...session, payment_status: "unpaid" }));
   assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=" + session.id), e)).status, 402);
   assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=../../etc"), e)).status, 400);
-  assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_live_ABCDEFGHIJKLMN"), e)).status, 400);
+  // P16: a session id for the other mode is "not found", not a 400 that reveals which mode is configured.
+  assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_live_ABCDEFGHIJKLMN"), e)).status, 404);
+  // P2: the 'unpaid' verdict is cached for 30 s; the verified webhook's 'paid' row bypasses that cache.
   mockStripe(() => jsonResp(session));
+  assert.equal((await worker.fetch(webhookReq({ type: "checkout.session.completed", data: { object: session } }), e)).status, 200);
   const md = await worker.fetch(getReq("/api/rro/pack?format=md&session_id=" + session.id), e);
   assert.equal(md.status, 200);
   const text = await md.text();
@@ -471,7 +474,9 @@ test("M1: paid cache and pack keep only the minimal session fields — never cus
   assert.doesNotMatch(await again.text(), /pii-test@example\.invalid|PII Person/);
 });
 
-test("M2/G1: pack lookups write nothing to D1 (cache-window limiter), are refused over the limit, and never purge", async () => {
+// P3 changed G1: the per-ip_hash pack-lookup limit is now also a global D1 counter. The cost stays bounded:
+// one aggregate row per IP per window (never a row per hit in rro_rate_hits), and nothing once over the limit.
+test("M2/G1+P3: pack lookups add no rro_rate_hits rows, keep ONE bounded counter row, are refused over the limit, and never purge", async () => {
   noStripe();
   const e = env();
   const db = e.RRO_CHECKOUT_DB._db;
@@ -482,6 +487,8 @@ test("M2/G1: pack lookups write nothing to D1 (cache-window limiter), are refuse
   for (let i = 0; i < 30; i++) assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_RLW" + String(i).padStart(17, "0")), e)).status, 404);
   for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(getReq("/rro/pack/success?session_id=cs_test_RLWOVER00000000001"), e)).status, 429);
   assert.equal(rows(), 0, "read paths must not insert rate-limit rows");
+  const ctr = db.prepare("SELECT bucket, n FROM rro_rate_counters").all();
+  assert.deepEqual(ctr.map((r) => [r.bucket, Number(r.n)]), [["pack_lookup", 30]], "one counter row, capped at the limit");
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, "seed", "GET lookups must not purge");
   await worker.scheduled({}, e);
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, null);
@@ -523,7 +530,7 @@ test("M4: Stripe network error -> 502 JSON; oversize Content-Length -> 413 befor
   mockStripe(() => { throw new TypeError("network down"); });
   const r = await worker.fetch(checkoutReq(), env());
   assert.equal(r.status, 502);
-  assert.equal((await r.json()).error, "STRIPE_SESSION_CREATE_FAILED");
+  assert.equal((await r.json()).error, "CHECKOUT_UNAVAILABLE");
   noStripe();
   const big = await worker.fetch(checkoutReq({}, { "Content-Length": "5000" }), env());
   assert.equal(big.status, 413);
@@ -857,7 +864,10 @@ test("G8: checkout DDL runs once per isolate even when each request gets a fresh
   let fails = 1;
   const flaky = { prepare: (sql) => e.RRO_CHECKOUT_DB.prepare(sql), batch: async (s) => { if (fails-- > 0) throw new Error("transient"); batches++; return e.RRO_CHECKOUT_DB.batch(s); } };
   const ev = { type: "checkout.session.completed", data: { object: paidSession("cs_test_DDLRETRY000000001") } };
-  await assert.rejects(worker.fetch(webhookReq(ev), { ...e, RRO_CHECKOUT_DB: flaky }));
+  // P16: the exception becomes a generic 500 (detail in the log only), not an unhandled rejection.
+  const failed = await worker.fetch(webhookReq(ev), { ...e, RRO_CHECKOUT_DB: flaky });
+  assert.equal(failed.status, 500);
+  assert.deepEqual(await failed.json(), { status: "error", error: "INTERNAL_ERROR" });
   assert.equal((await worker.fetch(webhookReq(ev), { ...e, RRO_CHECKOUT_DB: flaky })).status, 200);
 });
 
@@ -946,7 +956,7 @@ test("G12: pack lookup rejects a Stripe session whose livemode disagrees with th
   seedStart(e, sid);
   const r = await worker.fetch(getReq("/api/rro/pack?session_id=" + sid), e);
   assert.equal(r.status, 502);
-  assert.equal((await r.json()).error, "SESSION_MODE_MISMATCH");
+  assert.equal((await r.json()).error, "UNAVAILABLE"); // P16: internal SESSION_MODE_MISMATCH stays in the log
   const paid = e.RRO_CHECKOUT_DB._db.prepare("SELECT COUNT(*) AS n FROM rro_checkout_events WHERE kind = 'paid'").get();
   assert.equal(Number(paid.n), 0);
   // The matching flag still works.
@@ -1017,7 +1027,8 @@ test("P31: pack CSV and filename neutralise/reject hostile metadata (region, mit
   assert.equal(r.status, 200);
   const csv = await r.text();
   assert.doesNotMatch(csv, /HYPERLINK|evil\.example/);
-  assert.match(r.headers.get("Content-Disposition"), /filename="formal-tribunal-application-pack-london-/);
+  // P39: an unknown region is "all" in the pack path too (it used to become London here but "all" in the calculator).
+  assert.match(r.headers.get("Content-Disposition"), /filename="formal-tribunal-application-pack-all-/);
   for (const line of csv.split(/\r?\n/)) {
     if (line.startsWith("#") || line === "") continue;
     for (const cell of line.split(",")) {

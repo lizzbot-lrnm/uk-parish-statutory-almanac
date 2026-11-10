@@ -1,6 +1,7 @@
 // RRO £24 Stripe Checkout: formal pack, success page, /api/rro/* + /rro routing and CTA render.
 import {
   RRO_LOOKUP_RATE_LIMIT,
+  RRO_STRIPE_LOOKUP_GLOBAL_CAP,
   RRO_PREVIEW_COOKIE,
   RRO_TEST_MODE_LABEL,
   RRO_PACK_DOWNLOAD_DAYS,
@@ -12,6 +13,10 @@ import {
   rroIpPepper,
   rroIpHash,
   rroCacheRateLimitHit,
+  rroD1CounterHit,
+  rroRetryAfterSec,
+  rroNotPaidCacheGet,
+  rroNotPaidCachePut,
   RRO_PREVIEW_TTL_SEC,
   rroPreviewSecret,
   rroPreviewCookieFor,
@@ -144,37 +149,63 @@ function rroSessionWithinWindow(session) {
   return Date.now() - created * 1000 <= RRO_PACK_DOWNLOAD_DAYS * 86400000;
 }
 
-// T2 / W-M1: order is (1) session id shape check before anything else, (2) config checks,
-// (3) per-ip_hash fixed-window limit held in caches.default / isolate memory (NO D1 write on this
-// unauthenticated read path), (4) D1 read: a session_id we never created/recorded -> 404 with NO
-// Stripe call, (5) paid-verdict cache (<=10 min), (6) only then GET the session from Stripe.
+// T2 / W-M1 + P2/P3: order is (1) session id shape check before anything else, (2) config checks,
+// (3) per-ip_hash fixed-window pre-filter in caches.default / isolate memory (no D1 write; an over-limit
+// flood stops here), (4) P3: the same per-ip_hash limit as a GLOBAL D1 counter (one conditional upsert,
+// nothing written once over the limit), (5) D1 read: a session_id we never created/recorded -> 404 with
+// NO Stripe call, (6) paid-verdict cache (<=10 min), (7) P2: "not paid" verdict cache (30 s) unless the
+// webhook has already recorded 'paid', (8) P2: global Stripe-lookup cap (D1, all IPs), (9) only then
+// GET the session from Stripe. Internal error codes are mapped to generic public ones (P16) by the routes.
 async function rroLoadPaidSession(env, sessionId, request) {
   if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
   const mode = rroStripeMode(env);
   if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroWebhookSecret(env) || !rroIpPepper(env)) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
   const sessionMode = String(sessionId).startsWith("cs_live_") ? "live" : "test";
-  if (sessionMode !== mode.mode) return { ok: false, status: 400, error: "SESSION_MODE_MISMATCH" };
+  // P16: a session id for the other mode is simply "not found" (a 400 here revealed the configured mode).
+  if (sessionMode !== mode.mode) return { ok: false, status: 404, error: "SESSION_MODE_MISMATCH" };
   const db = env.RRO_CHECKOUT_DB;
   const ipHash = request ? await rroIpHash(request, env) : null;
   if (!ipHash) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
-  if (!(await rroCacheRateLimitHit("pack_lookup", ipHash, RRO_LOOKUP_RATE_LIMIT.max_hits, RRO_LOOKUP_RATE_LIMIT.window_minutes))) {
-    return { ok: false, status: 429, error: "RATE_LIMITED" };
-  }
+  const lim = RRO_LOOKUP_RATE_LIMIT;
+  const rateLimited = { ok: false, status: 429, error: "RATE_LIMITED", retryAfterSec: rroRetryAfterSec(lim.window_minutes) };
+  if (!(await rroCacheRateLimitHit("pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
   await rroEnsureCheckoutSchema(db);
+  if (!(await rroD1CounterHit(db, "pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
   const known = await db
-    .prepare("SELECT kind FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2 LIMIT 1")
+    .prepare("SELECT COUNT(*) AS n, MAX(kind = 'paid') AS paid FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2")
     .bind(sessionId, sessionMode)
     .first();
-  if (!known) return { ok: false, status: 404, error: "SESSION_NOT_FOUND" };
+  if (!known || !Number(known.n)) return { ok: false, status: 404, error: "SESSION_NOT_FOUND" };
   const cached = rroPaidCacheGet(sessionId) || (await rroPaidCacheApiGet(sessionId));
   if (cached && rroSessionIsPaidPack(cached) && cached.id === sessionId) {
     if (!rroSessionWithinWindow(cached)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
     return { ok: true, session: cached };
   }
+  // P2: short-circuit repeat lookups of a session Stripe just said is unpaid/unknown. A 'paid' row from the
+  // verified webhook skips this, so a buyer who refreshes right after paying is not held back 30 s.
+  if (!Number(known.paid)) {
+    const neg = await rroNotPaidCacheGet(sessionId);
+    if (neg) return { ok: false, status: neg.status, error: neg.error, cachedVerdict: true };
+  }
+  const cap = RRO_STRIPE_LOOKUP_GLOBAL_CAP;
+  if (!(await rroD1CounterHit(db, "stripe_lookup", "global", cap.max_hits, cap.window_minutes))) {
+    return { ok: false, status: 503, error: "STRIPE_LOOKUP_GLOBAL_CAP" };
+  }
   const res = await rroStripeRequest(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId));
-  if (!res.ok || !res.data) return { ok: false, status: res.status === 404 ? 404 : 502, error: "SESSION_LOOKUP_FAILED" };
+  if (!res.ok || !res.data) {
+    if (res.status === 404) {
+      const verdict = { status: 404, error: "SESSION_LOOKUP_FAILED" };
+      await rroNotPaidCachePut(sessionId, verdict);
+      return { ok: false, ...verdict };
+    }
+    return { ok: false, status: 502, error: "SESSION_LOOKUP_FAILED" };
+  }
   const session = res.data;
-  if (!rroSessionIsPaidPack(session)) return { ok: false, status: 402, error: "PAYMENT_NOT_COMPLETE" };
+  if (!rroSessionIsPaidPack(session)) {
+    const verdict = { status: 402, error: "PAYMENT_NOT_COMPLETE" };
+    await rroNotPaidCachePut(sessionId, verdict);
+    return { ok: false, ...verdict };
+  }
   if (session.id !== sessionId) return { ok: false, status: 502, error: "SESSION_LOOKUP_FAILED" };
   // Stripe's own livemode flag must agree with the key mode (same check as the webhook).
   if (Boolean(session.livemode) !== (sessionMode === "live")) return { ok: false, status: 502, error: "SESSION_MODE_MISMATCH" };
@@ -184,6 +215,24 @@ async function rroLoadPaidSession(env, sessionId, request) {
   rroPaidCachePut(sessionId, minimal);
   await rroPaidCacheApiPut(sessionId, minimal);
   return { ok: true, session: minimal };
+}
+
+// P16: anonymous callers only ever see one of these generic codes; the internal code (which can reveal
+// configuration state, key mode or expiry logic) goes to the Worker log only, without the session id.
+const RRO_PACK_PUBLIC_ERRORS = Object.freeze({
+  400: "INVALID_REQUEST",
+  402: "PAYMENT_NOT_COMPLETE",
+  404: "NOT_FOUND",
+  410: "NOT_AVAILABLE",
+  429: "RATE_LIMITED",
+  502: "UNAVAILABLE",
+  503: "UNAVAILABLE",
+});
+function rroPackPublicError(loaded, route) {
+  const status = Number(loaded && loaded.status) || 503;
+  console.log(JSON.stringify({ event: route === "success" ? "rro_pack_success_error" : "rro_pack_error", error: String((loaded && loaded.error) || "UNKNOWN"), status, cached: Boolean(loaded && loaded.cachedVerdict) }));
+  const headers = status === 429 ? { "Retry-After": String((loaded && loaded.retryAfterSec) || 600) } : {};
+  return { status, error: RRO_PACK_PUBLIC_ERRORS[status] || "UNAVAILABLE", headers };
 }
 
 function rroSuccessPageHtml(sessionId, session) {
@@ -229,18 +278,21 @@ async function rroHandleCheckoutRoutes(request, env, url) {
     const loaded = await rroLoadPaidSession(env, sid, request);
     if (!loaded.ok) {
       // Internal error codes stay in logs only (no session id, URL or token); the visitor sees generic text.
-      console.log(JSON.stringify({ event: "rro_pack_success_error", error: String(loaded.error || "UNKNOWN"), status: loaded.status }));
-      const msg = loaded.error === "PAYMENT_NOT_COMPLETE"
+      const pub = rroPackPublicError(loaded, "success");
+      const msg = pub.error === "PAYMENT_NOT_COMPLETE"
         ? "Payment not completed yet. If you just paid, refresh in a few seconds."
         : "We could not verify this purchase right now. If you have paid, keep your Stripe receipt and try this link again later.";
-      return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Application Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Application Pack</h1><p>' + D.escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: loaded.status, headers: RRO_CHECKOUT_HTML_HEADERS });
+      return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Application Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Application Pack</h1><p>' + D.escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: pub.status, headers: { ...RRO_CHECKOUT_HTML_HEADERS, ...pub.headers } });
     }
     return new Response(rroSuccessPageHtml(sid, loaded.session), { headers: RRO_CHECKOUT_HTML_HEADERS });
   }
   if (p === "/api/rro/pack") {
     const sid = url.searchParams.get("session_id") || "";
     const loaded = await rroLoadPaidSession(env, sid, request);
-    if (!loaded.ok) return rroJson({ status: "error", error: loaded.error }, loaded.status);
+    if (!loaded.ok) {
+      const pub = rroPackPublicError(loaded, "pack");
+      return rroJson({ status: "error", error: pub.error }, pub.status, pub.headers);
+    }
     const pack = rroBuildFormalPack(loaded.session);
     const fmt = String(url.searchParams.get("format") || "md").toLowerCase();
     const base = "formal-tribunal-application-pack-" + pack.inputs.region.toLowerCase() + "-" + String(sid).slice(-8);
