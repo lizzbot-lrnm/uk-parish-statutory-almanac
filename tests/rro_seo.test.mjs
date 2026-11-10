@@ -116,7 +116,7 @@ test("JSON-LD parses; FAQPage matches the visible FAQ word-for-word; Product/Off
   assert.equal(app.description, DESC);
   assert.equal(app.isAccessibleForFree, true);
   const product = ld["@graph"].find((n) => n["@type"] === "Product");
-  assert.equal(product.name, "Export Formal Tribunal Appeal Pack");
+  assert.equal(product.name, "Export Formal Tribunal Application Pack");
   const offer = product.offers;
   assert.equal(offer["@type"], "Offer");
   assert.equal(Number(offer.price), 24);
@@ -171,7 +171,7 @@ test("disabled state unchanged by SEO work: X-RRO-CTA hidden, no buy button, che
 test("live state (both gates): offer flips to InStock, CTA label exact", async () => {
   const { r, html } = await page(baseEnv({ STRIPE_SECRET_KEY: "sk_live_" + "FAKE0123456789", STRIPE_WEBHOOK_SECRET: FAKE_WHSEC, RRO_STRIPE_LIVE_ENABLED: "true" }));
   assert.equal(r.headers.get("X-RRO-CTA"), "live");
-  assert.match(html, />Export Formal Tribunal Appeal Pack — £24<\/button>/);
+  assert.match(html, />Export Formal Tribunal Application Pack — £24<\/button>/);
   assert.equal(offerOf(jsonLd(html)).availability, "https://schema.org/InStock");
 });
 

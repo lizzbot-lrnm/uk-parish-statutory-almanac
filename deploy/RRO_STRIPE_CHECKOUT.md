@@ -1,4 +1,4 @@
-# £24 "Export Formal Tribunal Appeal Pack" (Stripe Checkout on /rro)
+# £24 "Export Formal Tribunal Application Pack" (Stripe Checkout on /rro)
 
 Product approved by the site owner with the Day-7 kill rule below.
 Scope: one product only (no other live-money products). Hosted Stripe Checkout redirect (no Stripe.js / Elements).
@@ -37,9 +37,9 @@ The Stripe webhook likewise returns `503 {"error":"WEBHOOK_NOT_CONFIGURED"}` and
 ## T1: /rro CTA in test mode (production site)
 | State | What /rro shows |
 |---|---|
-| Live (exact flag + live key + security review + owner approval) | Normal "Export Formal Tribunal Appeal Pack — £24" CTA |
+| Live (exact flag + live key + security review + owner approval) | Normal "Export Formal Tribunal Application Pack — £24" CTA |
 | Test key, visitor has preview | Amber "[TEST MODE] …" button plus banner **"TEST MODE – no real payment; do not enter real card details."** Stripe Checkout also shows that text above the pay button (`custom_text[submit]`). |
-| Test key, no preview / not configured | **No CTA at all**, only the plain text "Formal Tribunal Appeal Pack (£24): checkout coming soon." (no button, no link, no Stripe call; `X-RRO-CTA: hidden`). Real visitors never reach a Stripe test checkout. |
+| Test key, no preview / not configured | **No CTA at all**, only the plain text "Formal Tribunal Application Pack (£24): checkout coming soon." (no button, no link, no Stripe call; `X-RRO-CTA: hidden`). Real visitors never reach a Stripe test checkout. |
 
 Preview (signed, key holder only): the link token is `<exp>.<HMAC-SHA256(RRO_PREVIEW_SECRET, "rro-preview-link-v2:" + exp)>` (hex), where `exp` is a unix time no more than 24h ahead; the expiry is inside the HMAC, so it can't be extended. Compute it locally with `exp=$(( $(date +%s) + 86400 )); echo "$exp.$(printf 'rro-preview-link-v2:%s' "$exp" | openssl dgst -sha256 -hmac "$RRO_PREVIEW_SECRET" | awk '{print $NF}')"` (never paste the secret or token in chat, notes or logs). Expired links, links more than 24h ahead and the old static v1 token are refused. The Worker never logs the token; Cloudflare's own request logs can still record the query string, which is why the link expires. Opening `/rro?rro_preview=<token>` returns a 302 to `/rro` (so the token leaves the URL bar, history and Referer; `Referrer-Policy: no-referrer` on `/rro`) and sets an `HttpOnly; Secure; SameSite=Lax` cookie (Lax so it survives Stripe's cancel redirect back to `/rro`; the checkout POST is still Origin-checked) `rro_preview=<exp>.<HMAC(secret, "rro-preview-cookie-v1:"+exp)>` valid 24h. Unsigned, forged, expired or wrong-key cookies are ignored, and if `RRO_PREVIEW_SECRET` is missing (or under 24 chars) preview fails closed: no CTA and `POST /api/rro/checkout` in test mode returns 503. Preview responses are `Cache-Control: private, no-store`; header `X-RRO-CTA` reports `live` / `test_preview` / `hidden`.
 

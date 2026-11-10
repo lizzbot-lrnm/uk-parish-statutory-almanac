@@ -153,7 +153,7 @@ test("checkout creates £24 GBP session with TEST MODE submit text, returns chec
     assert.equal(f.get("mode"), "payment");
     assert.equal(f.get("line_items[0][price_data][unit_amount]"), "2400");
     assert.equal(f.get("line_items[0][price_data][currency]"), "gbp");
-    assert.equal(f.get("line_items[0][price_data][product_data][name]"), "Export Formal Tribunal Appeal Pack");
+    assert.equal(f.get("line_items[0][price_data][product_data][name]"), "Export Formal Tribunal Application Pack");
     assert.equal(f.get("success_url"), ORIGIN + "/rro/pack/success?session_id={CHECKOUT_SESSION_ID}");
     assert.ok(f.get("cancel_url").startsWith(ORIGIN + "/rro"));
     assert.equal(f.get("metadata[region]"), "Northern");
@@ -336,9 +336,9 @@ test("pack download requires a verified paid session and returns the formal pack
   const md = await worker.fetch(getReq("/api/rro/pack?format=md&session_id=" + session.id), e);
   assert.equal(md.status, 200);
   const text = await md.text();
-  assert.match(text, /^# Formal Tribunal Appeal Pack/);
+  assert.match(text, /^# Formal Tribunal Application Pack/);
   assert.match(text, /Scott Schedule/);
-  assert.match(md.headers.get("Content-Disposition"), /attachment; filename="formal-tribunal-appeal-pack-london-/);
+  assert.match(md.headers.get("Content-Disposition"), /attachment; filename="formal-tribunal-application-pack-london-/);
   const csv = await worker.fetch(getReq("/api/rro/pack?format=csv&session_id=" + session.id), e);
   assert.match(await csv.text(), /case_ref,region/);
 });
@@ -409,7 +409,7 @@ test("T1: /rro?rro_preview=<signed token> in test mode shows CTA with TEST MODE 
   const html = await r.text();
   assert.equal(r.headers.get("Referrer-Policy"), "no-referrer");
   assert.match(html, /id="formalPackBtn"/);
-  assert.match(html, /\[TEST MODE\] Export Formal Tribunal Appeal Pack — £24/);
+  assert.match(html, /\[TEST MODE\] Export Formal Tribunal Application Pack — £24/);
   assert.match(html, /TEST MODE – no real payment; do not enter real card details/);
   assert.equal(r.headers.get("X-RRO-CTA"), "test_preview");
   assert.match(setCookie, /^rro_preview=\d+\.[0-9a-f]{64};.*HttpOnly.*SameSite=Lax/);
@@ -421,7 +421,7 @@ test("T1: /rro?rro_preview=<signed token> in test mode shows CTA with TEST MODE 
 test("/rro in (gated) live mode has the plain £24 CTA, no TEST label; CSP allows Stripe Checkout form-action", async () => {
   const r = await worker.fetch(getReq("/rro"), env({ STRIPE_SECRET_KEY: FAKE_LIVE_KEY, RRO_STRIPE_LIVE_ENABLED: "true" }));
   const html = await r.text();
-  assert.match(html, /Export Formal Tribunal Appeal Pack — £24/);
+  assert.match(html, /Export Formal Tribunal Application Pack — £24/);
   assert.doesNotMatch(html, /\[TEST MODE\]/);
   assert.match(html, /\/api\/rro\/checkout/);
   assert.doesNotMatch(html, /Dossier Pack \(£29\)/);
@@ -961,4 +961,46 @@ test("G13: pack, success and telemetry answer other methods with 405 and Allow: 
     assert.equal(r.status, 405, path);
     assert.equal(r.headers.get("Allow"), "GET, HEAD", path);
   }
+});
+
+// ---------------------------------------------------------------- P27/P28: an RRO is an application, not an appeal; no fleet-internal wording
+const BANNED = [/appeal pack/i, /appeal-pack/i, /north ?star/i];
+const assertClean = (label, text) => { for (const re of BANNED) assert.doesNotMatch(String(text), re, label + " must not match " + re); };
+
+test("P27/P28: no customer-facing output says 'appeal pack' or 'North Star' (all /rro CTA states, home, llms.txt, Stripe line item, success page, pack)", async () => {
+  // /rro in every CTA state
+  const states = [
+    ["hidden (no Stripe)", {}, {}, "hidden"],
+    ["test preview", env(), PREVIEW, "test_preview"],
+    ["live", env({ STRIPE_SECRET_KEY: FAKE_LIVE_KEY, RRO_STRIPE_LIVE_ENABLED: "true" }), {}, "live"],
+  ];
+  for (const [label, e, headers, cta] of states) {
+    const r = await worker.fetch(getReq("/rro", headers), label.startsWith("hidden") ? { RRO_IP_PEPPER: FAKE_PEPPER, RRO_CHECKOUT_DB: fakeD1() } : e);
+    assert.equal(r.headers.get("X-RRO-CTA"), cta, label);
+    const html = await r.text();
+    assertClean("/rro " + label, html);
+    assert.match(html, /Formal Tribunal Application Pack/, label);
+  }
+  for (const p of ["/", "/llms.txt", "/rro/london"]) assertClean(p, await (await worker.fetch(getReq(p), env())).text());
+  // Stripe line item name + description
+  let seen = null;
+  mockStripe((url, init) => { seen = new URLSearchParams(init.body); return jsonResp({ id: "cs_test_P27NAME0000000001", url: "https://checkout.stripe.com/c/pay/cs_test_P27NAME0000000001" }); });
+  await worker.fetch(checkoutReq({}, PREVIEW), env());
+  assert.ok(seen, "Stripe session request was built");
+  assert.equal(seen.get("line_items[0][price_data][product_data][name]"), "Export Formal Tribunal Application Pack");
+  assertClean("line item name", seen.get("line_items[0][price_data][product_data][name]"));
+  assertClean("line item description", seen.get("line_items[0][price_data][product_data][description]"));
+  assert.doesNotMatch(seen.get("line_items[0][price_data][product_data][description]"), /appeal/i);
+  // Success page and the pack itself
+  const e = env();
+  const session = paidSession("cs_test_P27SUCCESS00000001");
+  seedStart(e, session.id);
+  mockStripe(() => jsonResp(session));
+  const ok = await worker.fetch(getReq("/rro/pack/success?session_id=" + session.id), e);
+  assert.equal(ok.status, 200);
+  const okHtml = await ok.text();
+  assertClean("success page", okHtml);
+  assert.match(okHtml, /Formal Tribunal Application Pack/);
+  const md = await worker.fetch(getReq("/api/rro/pack?format=md&session_id=" + session.id), e);
+  assertClean("pack markdown + filename", (await md.text()) + md.headers.get("Content-Disposition"));
 });

@@ -19,8 +19,8 @@ Live Streamable HTTP MCP Endpoint (`JSON-RPC 2.0`): **https://parish.technoplusi
 7. **Apify-to-MCP `input_schema.json` Silent Bug Linter & Auto-Fixer (`/api/apify-mcp-lint`)** (`required` + `default` silent drop protection & `prefill` enforcement)
 
 
-## Export Formal Tribunal Appeal Pack — £24 (Stripe Checkout)
-The `/rro` calculator offers **"Export Formal Tribunal Appeal Pack — £24"** via a hosted Stripe Checkout Session redirect. The offer is shown only when checkout is fully configured; otherwise the calculator works with no paid CTA.
+## Export Formal Tribunal Application Pack — £24 (Stripe Checkout)
+The `/rro` calculator offers **"Export Formal Tribunal Application Pack — £24"** via a hosted Stripe Checkout Session redirect. The offer is shown only when checkout is fully configured; otherwise the calculator works with no paid CTA.
 Config, routes, fail-closed behaviour and deploy steps: [`deploy/RRO_STRIPE_CHECKOUT.md`](deploy/RRO_STRIPE_CHECKOUT.md).
 
 ## Running Tests

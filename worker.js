@@ -1062,7 +1062,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   </header>
   <main class="container">
     <div class="callout" style="background:#eff6ff;border-left:4px solid #1d4ed8;">
-      <strong>NEW NORTH STAR LIVE — <a href="/rro" style="color:#1d4ed8;font-weight:700;">Rent Repayment Order (RRO) tribunal precedent finder (/rro) &rarr;</a></strong><br/>
+      <strong><a href="/rro" style="color:#1d4ed8;font-weight:700;">Rent Repayment Order (RRO) tribunal precedent finder (/rro) &rarr;</a></strong><br/>
       For tenants, tenant advisers and local housing authority enforcement teams (Housing and Planning Act 2016 s.41 &mdash; not parish or town councils).<br/>
       Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>private claim check</strong> (your text is not stored), or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
     </div>
@@ -2184,7 +2184,7 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <span class="badge">281 published GOV.UK tribunal decisions</span>
         <span class="badge">Open Government Licence v3.0</span>
         <span class="badge">Private claim check (text not stored)</span>
-        <span class="badge" id="northStarBadge" style="background:#0d9488;color:#fff;font-weight:700;">Free precedent search</span>
+        <span class="badge" id="freeSearchBadge" style="background:#0d9488;color:#fff;font-weight:700;">Free precedent search</span>
       </div>
     </div>
   </header>
@@ -2421,7 +2421,7 @@ This site is not a law firm and the figures here are not a prediction of what a 
     document.getElementById("offence").addEventListener("change", runRroSearch);
     document.getElementById("mitigation").addEventListener("change", runRroSearch);
     // Usage counters are private (/api/rro/stats needs RRO_TELEMETRY_TOKEN), so the page shows no live counts.
-    async function refreshNorthStarBadge() {}
+    async function refreshFreeSearchBadge() {}
 
     async function runRroCalc() {
       const monthly_rent_gbp = document.getElementById("calcRent").value;
@@ -2473,26 +2473,26 @@ This site is not a law firm and the figures here are not a prediction of what a 
     }
     if (new URLSearchParams(window.location.search).get("checkout") === "cancelled") {
       const n = document.getElementById("formalPackNote");
-      if (n) n.textContent = "Checkout cancelled — no payment was taken. You can export the Formal Tribunal Appeal Pack any time for £24.";
+      if (n) n.textContent = "Checkout cancelled — no payment was taken. You can export the Formal Tribunal Application Pack any time for £24.";
     }
     const calcBtnEl = document.getElementById("calcBtn");
     if (calcBtnEl) {
       calcBtnEl.addEventListener("click", async () => {
         await runRroCalc();
-        await refreshNorthStarBadge();
+        await refreshFreeSearchBadge();
       });
     }
     document.getElementById("auditBtn").addEventListener("click", async () => {
       await runPrivateAudit();
-      await refreshNorthStarBadge();
+      await refreshFreeSearchBadge();
     });
     document.getElementById("searchBtn").addEventListener("click", async () => {
-      await refreshNorthStarBadge();
+      await refreshFreeSearchBadge();
     });
     (async () => {
       await runRroSearch();
       await runPrivateAudit();
-      await refreshNorthStarBadge();
+      await refreshFreeSearchBadge();
     })();
   </script>
 </body>
