@@ -19,10 +19,14 @@ import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
 // Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
 // with the bounded streaming read in src/rro_core.js (a missing or lying Content-Length cannot bypass it).
 const PUBLIC_POST_BODY_MAX_BYTES = 64 * 1024;
+// P1: POST /api/rro-search and /api/rro-calculate take a flat JSON object of at most ~10 short fields
+// (the /rro page itself uses GET; a POST with every field filled is ~350 bytes and a long
+// mitigation_factors list stays under 2 KB; the GET form of the same inputs must fit in a URL), so 16 KiB is ample. Same bounded read: Content-Length refused first, then a streamed byte count.
+const RRO_JSON_POST_BODY_MAX_BYTES = 16 * 1024;
 const readCappedBody = (request, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) => rroReadCappedBody(request, maxBytes);
-function payloadTooLarge(corsHeaders) {
+function payloadTooLarge(corsHeaders, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) {
   return Response.json(
-    { status: "error", error: "PAYLOAD_TOO_LARGE", max_bytes: PUBLIC_POST_BODY_MAX_BYTES },
+    { status: "error", error: "PAYLOAD_TOO_LARGE", max_bytes: maxBytes },
     { status: 413, headers: { ...(corsHeaders || {}), "Cache-Control": "no-store" } }
   );
 }
@@ -2816,8 +2820,10 @@ export default {
         format: url.searchParams.get("format") || "json",
       };
       if (request.method === "POST") {
+        const capped = await readCappedBody(request, RRO_JSON_POST_BODY_MAX_BYTES);
+        if (!capped.ok) return payloadTooLarge(corsHeaders, RRO_JSON_POST_BODY_MAX_BYTES);
         try {
-          const body = await request.json();
+          const body = JSON.parse(capped.text);
           params = { ...params, ...body };
         } catch (_) {}
       }
@@ -2854,8 +2860,10 @@ export default {
         format: url.searchParams.get("format") || "json",
       };
       if (request.method === "POST") {
+        const capped = await readCappedBody(request, RRO_JSON_POST_BODY_MAX_BYTES);
+        if (!capped.ok) return payloadTooLarge(corsHeaders, RRO_JSON_POST_BODY_MAX_BYTES);
         try {
-          const body = await request.json();
+          const body = JSON.parse(capped.text);
           params = { ...params, ...body };
         } catch (_) {}
       }
