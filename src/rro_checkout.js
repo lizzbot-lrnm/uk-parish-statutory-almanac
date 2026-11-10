@@ -174,7 +174,7 @@ async function rroHandleStripeWebhook(request, env) {
   try {
     await rroPurgeIpHashesBounded(env.RRO_CHECKOUT_DB, RRO_OPPORTUNISTIC_PURGE_LIMIT);
   } catch (err) {
-    console.log({ event: "rro_webhook_purge_failed", error: String((err && err.message) || err).slice(0, 200) });
+    console.log(JSON.stringify({ event: "rro_webhook_purge_failed", error: String((err && err.message) || err).slice(0, 200) }));
   }
   return rroJson({ status: "ok", recorded: inserted, duplicate: !inserted });
 }

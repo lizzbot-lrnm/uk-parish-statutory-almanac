@@ -35,9 +35,10 @@ const RRO_NOT_PAID_CACHE_TTL_MS = 30 * 1000;
 // P2: global cap on Stripe session lookups (all IPs together), D1-backed so it holds across colos.
 const RRO_STRIPE_LOOKUP_GLOBAL_CAP = { max_hits: 300, window_minutes: 10 };
 // P15: per-IP limit on the public search + calculate API (GET and POST, every path alias), one shared bucket.
-// The colo counter (isolate Map + caches.default) is exact per colo and costs no D1 write; every
-// flush_every-th admitted hit in a colo adds flush_every to a global D1 counter, so a normal visitor
-// (< flush_every requests per window) causes zero D1 writes.
+// The colo counter (isolate Map + caches.default) costs no D1 write and is best-effort per colo (two isolates
+// can race on the cache read/put, so a colo may over- or under-count by a few); every flush_every-th admitted
+// hit in a colo adds flush_every to a global D1 counter, so a normal visitor (< flush_every requests per
+// window) causes zero D1 writes, and the D1 total is what bounds a visitor across colos.
 const RRO_PUBLIC_RATE_LIMIT = { max_hits: 120, window_minutes: 10, flush_every: 10 };
 const RRO_IP_HASH_RETENTION_HOURS = 48;
 const RRO_PREVIEW_COOKIE = "rro_preview";
@@ -218,6 +219,7 @@ async function rroD1CounterAdd(db, bucket, keyHash, delta, windowMinutes, nowMs)
   return Number((row && row.n) || 0);
 }
 
+let RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = false;
 // P15: per-IP limit for the public search/calculate API. Returns { allowed, retryAfterSec }.
 // Fails OPEN (allowed, logged) if the pepper is missing or D1 errors: these are free public tools over
 // public OGL data, so an infrastructure fault must not take them offline. The colo limit still applies.
@@ -225,7 +227,13 @@ async function rroPublicRateLimit(request, env, bucket, nowMs) {
   const now = typeof nowMs === "number" ? nowMs : Date.now();
   const lim = RRO_PUBLIC_RATE_LIMIT;
   const ipHash = await rroIpHash(request, env || {});
-  if (!ipHash) return { allowed: true, skipped: "no_pepper" };
+  if (!ipHash) {
+    if (!RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED) {
+      RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = true;
+      console.log(JSON.stringify({ event: "rro_public_rate_limit_disabled", reason: "RRO_IP_PEPPER_MISSING" }));
+    }
+    return { allowed: true, skipped: "no_pepper" };
+  }
   const local = await rroCacheRateLimitCount(bucket, ipHash, lim.max_hits, lim.window_minutes, now);
   const limited = { allowed: false, retryAfterSec: rroRetryAfterSec(lim.window_minutes, now) };
   if (!local.allowed) return limited;
@@ -316,9 +324,11 @@ function rroResetIsolateStateForTests() {
   RRO_NOT_PAID_CACHE.clear();
 }
 
-// P39 / P24: Content-Security-Policy for HTML pages. Every inline executable <script> (no src, not a JSON
-// data block) is allowed by its exact sha256 hash, computed from the HTML actually served, so there is no
-// 'unsafe-inline' for scripts and an injected <script> or on*= handler will not run. Memoised per script text.
+// P39 / P24: Content-Security-Policy for HTML pages. The allowed inline scripts are hashed from the TRUSTED
+// page template constant in worker.js (HTML_PAGE / RRO_HTML_PAGE), never from the response body, so a
+// <script> that reached the output any other way (e.g. injected through data) is not allow-listed and will
+// not run; on*= handlers are blocked by script-src-attr 'none'. No 'unsafe-inline' for scripts.
+// Memoised per template (a handful of module constants), so the digest runs once per isolate per page.
 const RRO_CSP_HASH_MEMO = new Map();
 const RRO_INLINE_SCRIPT_RE = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi;
 async function rroInlineScriptHashes(html) {
@@ -328,19 +338,20 @@ async function rroInlineScriptHashes(html) {
     if (/\bsrc\s*=/i.test(attrs)) continue;
     const t = /\btype\s*=\s*["']?([^"'\s>]+)/i.exec(attrs);
     if (t && !/^(text|application)\/(java|ecma)script$|^module$/i.test(t[1])) continue; // e.g. application/ld+json: data, not executed
-    const text = m[2];
-    let h = RRO_CSP_HASH_MEMO.get(text);
-    if (!h) {
-      const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-      h = "'sha256-" + btoa(String.fromCharCode(...new Uint8Array(d))) + "'";
-      if (RRO_CSP_HASH_MEMO.size < 64) RRO_CSP_HASH_MEMO.set(text, h);
-    }
+    const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(m[2]));
+    const h = "'sha256-" + btoa(String.fromCharCode(...new Uint8Array(d))) + "'";
     if (!out.includes(h)) out.push(h);
   }
   return out;
 }
-async function rroHtmlCsp(html) {
-  const hashes = await rroInlineScriptHashes(html);
+// trustedTemplate: a module-constant page template (never request- or data-derived). "" => no inline scripts.
+async function rroHtmlCsp(trustedTemplate) {
+  const key = String(trustedTemplate || "");
+  let hashes = RRO_CSP_HASH_MEMO.get(key);
+  if (!hashes) {
+    hashes = await rroInlineScriptHashes(key);
+    if (RRO_CSP_HASH_MEMO.size < 8) RRO_CSP_HASH_MEMO.set(key, hashes);
+  }
   return [
     "default-src 'self'",
     "script-src 'self'" + (hashes.length ? " " + hashes.join(" ") : ""),
@@ -378,10 +389,29 @@ function rroIpPepper(env) {
   return pepper;
 }
 
+// P3/P15: rate limits key on the network, not the exact address: an IPv6 client is bucketed by its /64
+// (one subscriber allocation), so rotating addresses inside a /64 does not mint new identities.
+// IPv4 (and IPv4-mapped IPv6) is used as-is. Anything unparsable is used verbatim.
+function rroIpBucket(ip) {
+  const s = String(ip || "").trim().toLowerCase();
+  if (!s.includes(":")) return s;
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+  if (mapped) return mapped[1];
+  const halves = s.split("::");
+  if (halves.length > 2) return s;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return s;
+  const parts = [...head, ...Array(fill).fill("0"), ...tail];
+  if (parts.length !== 8 || parts.some((p) => !/^[0-9a-f]{1,4}$/.test(p))) return s;
+  return parts.slice(0, 4).map((p) => p.replace(/^0+(?=.)/, "")).join(":") + "::/64";
+}
+
 async function rroIpHash(request, env) {
   const pepper = rroIpPepper(env);
   if (!pepper) return null;
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const ip = rroIpBucket(request.headers.get("CF-Connecting-IP") || "unknown");
   const day = new Date().toISOString().slice(0, 10);
   return (await rroHmacSha256Hex(pepper, day + ":" + ip)).slice(0, 32);
 }
@@ -524,10 +554,11 @@ function rroCleanInputs(raw) {
     if (!Number.isFinite(n)) return d;
     return Math.max(lo, Math.min(hi, Math.round(n * 100) / 100));
   };
-  // P39: same region rule as the calculator (worker.js rroCalcRegion): allowlisted in any case; missing ->
-  // London; anything else -> "all". Before this, an unknown region was "all" in the calculator but "London" here.
+  // P39: same region rule as the calculator (worker.js rroCalcRegion): allowlisted in any case; missing or
+  // blank -> London; anything else -> "all". Before this, an unknown region was "all" in the calculator but
+  // "London" here.
   const regions = ["London", "Southern", "Midlands", "Northern", "Eastern"];
-  const rawRegion = String(src.region ?? "London").trim().toLowerCase();
+  const rawRegion = String(src.region ?? "").trim().toLowerCase() || "london";
   const region = regions.find((r) => r.toLowerCase() === rawRegion) || "all";
   const role = String(src.party_role || src.role || "").toLowerCase().includes("tenant") ? "tenant_claim" : "landlord_defence";
   const mitigation = String(src.mitigation_factors || src.mitigation || "")
@@ -668,6 +699,7 @@ export {
   rroJson,
   rroIpPepper,
   rroIpHash,
+  rroIpBucket,
   rroPurgeIpHashes,
   rroRateLimitHit,
   rroCookie,

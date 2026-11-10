@@ -13,7 +13,7 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
-import { rroCsvCell, rroEnsureCheckoutSchema, rroHtmlCsp, rroJson, rroPublicRateLimit, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
+import { rroCsvCell, rroEnsureCheckoutSchema, rroHtmlCsp, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
 import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
 
 // Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
@@ -30,7 +30,7 @@ function payloadTooLarge(corsHeaders, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) {
     { status: 413, headers: { ...(corsHeaders || {}), "Cache-Control": "no-store" } }
   );
 }
-import { rroHandleCheckoutRoutes, rroRenderRroPage, setRroDeps } from "./src/rro_pages.js";
+import { rroHandleCheckoutRoutes, rroPublicApiRateLimitResponse, rroRenderRroPage, rroUnhandledErrorResponse, setRroDeps } from "./src/rro_pages.js";
 
 const GOV_UK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json";
 const POSTCODES_IO_URL = "https://api.postcodes.io/postcodes";
@@ -1473,7 +1473,7 @@ const MITIGATION_PCT_ADJUSTMENTS = {
 // P31: calculator inputs get the same allowlist / clamping as the pack path (src/rro_core.js rroCleanInputs).
 const RRO_CALC_REGIONS = ["London", "Southern", "Midlands", "Northern", "Eastern"];
 function rroCalcRegion(v) {
-  const raw = String(v ?? "London").trim().toLowerCase();
+  const raw = String(v ?? "").trim().toLowerCase() || "london"; // P39: missing or blank -> London (same as the pack path)
   return RRO_CALC_REGIONS.find((r) => r.toLowerCase() === raw) || "all"; // unknown -> all regions, never echoed
 }
 function rroCalcOffence(v) {
@@ -2768,10 +2768,11 @@ async function handleFetch(request, env = {}, ctx) {
       "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
     };
     // P39 / P24: HTML pages carry a hash-based CSP (no 'unsafe-inline' scripts), frame-ancestors 'none'
-    // plus X-Frame-Options DENY (from corsHeaders) and nosniff. The CSP is built from the exact HTML served.
-    const htmlHeadersFor = async (html) => ({
+    // plus X-Frame-Options DENY and nosniff (from corsHeaders). The script hashes come from the trusted page
+    // template constant passed in here, never from the response body.
+    const htmlHeadersFor = async (trustedTemplate) => ({
       ...corsHeaders,
-      "Content-Security-Policy": await rroHtmlCsp(html),
+      "Content-Security-Policy": await rroHtmlCsp(trustedTemplate),
       "Content-Type": "text/html; charset=utf-8",
     });
 
@@ -2852,7 +2853,7 @@ async function handleFetch(request, env = {}, ctx) {
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
       const rroPage = await rroRenderRroPage(request, env || {}, url);
-      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...(await htmlHeadersFor(rroPage.html)), ...rroPage.headers });
+      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...(await htmlHeadersFor(RRO_HTML_PAGE)), ...rroPage.headers });
       for (const c of rroPage.cookies || []) rroHeaders.append("Set-Cookie", c);
       if (rroPage.redirect) return new Response(null, { status: 302, headers: rroHeaders });
       return new Response(rroPage.html, { headers: rroHeaders });
@@ -2891,7 +2892,7 @@ async function handleFetch(request, env = {}, ctx) {
             return Response.json(rendered, { headers: corsHeaders });
           }
           return new Response(rendered, {
-            headers: await htmlHeadersFor(rendered),
+            headers: await htmlHeadersFor(""), // SEO pages have no executable inline script (JSON-LD only)
           });
         }
         return Response.json(
@@ -2901,14 +2902,9 @@ async function handleFetch(request, env = {}, ctx) {
       }
     }
 
-    // P15: per-IP (peppered daily ip_hash, never the raw IP) limit on search + calculate, checked before any
-    // body is read. 429 is no-store with Retry-After; see src/rro_core.js rroPublicRateLimit for D1 cost.
-    if (RRO_PUBLIC_API_PATHS.has(url.pathname)) {
-      const rl = await rroPublicRateLimit(request, env || {}, "public_api");
-      if (!rl.allowed) {
-        return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(rl.retryAfterSec), "Access-Control-Allow-Origin": "*" });
-      }
-    }
+    // P15: per-IP limit on search + calculate, every alias, checked before any body is read (src/rro_pages.js).
+    const rroLimited = await rroPublicApiRateLimitResponse(request, env || {}, url);
+    if (rroLimited) return rroLimited;
 
     if (
       url.pathname === "/api/rro-search" ||
@@ -3298,27 +3294,13 @@ async function handleFetch(request, env = {}, ctx) {
     );
 }
 
-// P15: every alias of the public search + calculate API (GET and POST) shares one per-IP limit.
-const RRO_PUBLIC_API_PATHS = new Set([
-  "/api/rro-search",
-  "/api/rro/search",
-  "/api/rro/search/",
-  "/api/rro-calculate",
-  "/api/rro/calculate",
-  "/api/rro/calculate/",
-]);
-
 export default {
-  // P16: an unexpected exception never reaches the client as a stack, message or Cloudflare error page:
-  // the visitor gets a generic 500 and the detail (message only, no request data) goes to the log.
+  // P16: an unexpected exception becomes a generic 500; the detail goes to the log only (src/rro_pages.js).
   async fetch(request, env = {}, ctx) {
     try {
       return await handleFetch(request, env, ctx);
     } catch (err) {
-      let path = "";
-      try { path = new URL(request.url).pathname.slice(0, 120); } catch (_) {}
-      console.log(JSON.stringify({ event: "unhandled_error", path, error: String((err && err.message) || err).slice(0, 200) }));
-      return rroJson({ status: "error", error: "INTERNAL_ERROR" }, 500);
+      return rroUnhandledErrorResponse(err, request);
     }
   },
 

@@ -12,6 +12,7 @@ import {
   rroJson,
   rroIpPepper,
   rroIpHash,
+  rroPublicRateLimit,
   rroCacheRateLimitHit,
   rroD1CounterHit,
   rroRetryAfterSec,
@@ -151,11 +152,13 @@ function rroSessionWithinWindow(session) {
 
 // T2 / W-M1 + P2/P3: order is (1) session id shape check before anything else, (2) config checks,
 // (3) per-ip_hash fixed-window pre-filter in caches.default / isolate memory (no D1 write; an over-limit
-// flood stops here), (4) P3: the same per-ip_hash limit as a GLOBAL D1 counter (one conditional upsert,
-// nothing written once over the limit), (5) D1 read: a session_id we never created/recorded -> 404 with
-// NO Stripe call, (6) paid-verdict cache (<=10 min), (7) P2: "not paid" verdict cache (30 s) unless the
-// webhook has already recorded 'paid', (8) P2: global Stripe-lookup cap (D1, all IPs), (9) only then
-// GET the session from Stripe. Internal error codes are mapped to generic public ones (P16) by the routes.
+// flood stops here), (4) D1 read: a session_id we never created/recorded -> 404 with NO Stripe call and
+// NO D1 write (random-id floods only cost bounded reads, as in G1), (5) P3: for a known session, the same
+// per-ip_hash limit as a GLOBAL D1 counter (one conditional upsert, nothing written once over the limit),
+// (6) paid-verdict cache (<=10 min), (7) P2: "not paid" verdict cache (30 s) unless the webhook has already
+// recorded 'paid', (8) P2: global Stripe-lookup cap (D1, all IPs) for sessions NOT yet recorded as paid, so
+// unpaid-session polling cannot exhaust it for real buyers, (9) only then GET the session from Stripe.
+// Internal error codes are mapped to generic public ones (P16) by the routes.
 async function rroLoadPaidSession(env, sessionId, request) {
   if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
   const mode = rroStripeMode(env);
@@ -170,12 +173,13 @@ async function rroLoadPaidSession(env, sessionId, request) {
   const rateLimited = { ok: false, status: 429, error: "RATE_LIMITED", retryAfterSec: rroRetryAfterSec(lim.window_minutes) };
   if (!(await rroCacheRateLimitHit("pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
   await rroEnsureCheckoutSchema(db);
-  if (!(await rroD1CounterHit(db, "pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
   const known = await db
     .prepare("SELECT COUNT(*) AS n, MAX(kind = 'paid') AS paid FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2")
     .bind(sessionId, sessionMode)
     .first();
   if (!known || !Number(known.n)) return { ok: false, status: 404, error: "SESSION_NOT_FOUND" };
+  if (!(await rroD1CounterHit(db, "pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
+  const paidInD1 = Boolean(Number(known.paid));
   const cached = rroPaidCacheGet(sessionId) || (await rroPaidCacheApiGet(sessionId));
   if (cached && rroSessionIsPaidPack(cached) && cached.id === sessionId) {
     if (!rroSessionWithinWindow(cached)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
@@ -183,13 +187,13 @@ async function rroLoadPaidSession(env, sessionId, request) {
   }
   // P2: short-circuit repeat lookups of a session Stripe just said is unpaid/unknown. A 'paid' row from the
   // verified webhook skips this, so a buyer who refreshes right after paying is not held back 30 s.
-  if (!Number(known.paid)) {
+  if (!paidInD1) {
     const neg = await rroNotPaidCacheGet(sessionId);
     if (neg) return { ok: false, status: neg.status, error: neg.error, cachedVerdict: true };
-  }
-  const cap = RRO_STRIPE_LOOKUP_GLOBAL_CAP;
-  if (!(await rroD1CounterHit(db, "stripe_lookup", "global", cap.max_hits, cap.window_minutes))) {
-    return { ok: false, status: 503, error: "STRIPE_LOOKUP_GLOBAL_CAP" };
+    const cap = RRO_STRIPE_LOOKUP_GLOBAL_CAP;
+    if (!(await rroD1CounterHit(db, "stripe_lookup", "global", cap.max_hits, cap.window_minutes))) {
+      return { ok: false, status: 503, error: "STRIPE_LOOKUP_GLOBAL_CAP" };
+    }
   }
   const res = await rroStripeRequest(env, "GET", "/v1/checkout/sessions/" + encodeURIComponent(sessionId));
   if (!res.ok || !res.data) {
@@ -430,4 +434,33 @@ async function rroRenderRroPage(request, env, url) {
 }
 // --------------------------- end RRO checkout ---------------------------
 
-export { rroHandleCheckoutRoutes, rroRenderRroPage, RRO_FAQ };
+// P15: every alias of the public search + calculate API (GET, POST, any method) shares one per-IP bucket.
+// Runs before the route reads any body. 429 is no-store (rroJson) with Retry-After and CORS like the API.
+const RRO_PUBLIC_API_PATHS = new Set([
+  "/api/rro-search",
+  "/api/rro/search",
+  "/api/rro/search/",
+  "/api/rro-calculate",
+  "/api/rro/calculate",
+  "/api/rro/calculate/",
+]);
+async function rroPublicApiRateLimitResponse(request, env, url) {
+  if (!RRO_PUBLIC_API_PATHS.has(url.pathname)) return null;
+  const rl = await rroPublicRateLimit(request, env || {}, "public_api");
+  if (rl.allowed) return null;
+  return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(rl.retryAfterSec), "Access-Control-Allow-Origin": "*" });
+}
+
+// P16: an unexpected exception never reaches the client as a stack, message or Cloudflare error page.
+// The visitor gets a generic no-store 500; the log gets the path and the error message only (no query
+// string, headers, body or stack).
+function rroUnhandledErrorResponse(err, request) {
+  let path = "";
+  try {
+    path = new URL(request.url).pathname.slice(0, 120);
+  } catch (_) {}
+  console.log(JSON.stringify({ event: "unhandled_error", path, error: String((err && err.message) || err).slice(0, 200) }));
+  return rroJson({ status: "error", error: "INTERNAL_ERROR" }, 500);
+}
+
+export { rroHandleCheckoutRoutes, rroRenderRroPage, rroPublicApiRateLimitResponse, rroUnhandledErrorResponse, RRO_PUBLIC_API_PATHS, RRO_FAQ };

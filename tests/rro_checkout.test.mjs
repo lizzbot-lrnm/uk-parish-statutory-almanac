@@ -474,9 +474,9 @@ test("M1: paid cache and pack keep only the minimal session fields — never cus
   assert.doesNotMatch(await again.text(), /pii-test@example\.invalid|PII Person/);
 });
 
-// P3 changed G1: the per-ip_hash pack-lookup limit is now also a global D1 counter. The cost stays bounded:
-// one aggregate row per IP per window (never a row per hit in rro_rate_hits), and nothing once over the limit.
-test("M2/G1+P3: pack lookups add no rro_rate_hits rows, keep ONE bounded counter row, are refused over the limit, and never purge", async () => {
+// P3 keeps G1 for unknown ids: the global D1 per-IP counter only runs once the session is known to D1,
+// so a flood of random well-formed ids costs bounded D1 reads and no D1 writes.
+test("M2/G1+P3: unknown-id pack lookups write nothing to D1 (cache-window limiter), are refused over the limit, and never purge", async () => {
   noStripe();
   const e = env();
   const db = e.RRO_CHECKOUT_DB._db;
@@ -487,8 +487,8 @@ test("M2/G1+P3: pack lookups add no rro_rate_hits rows, keep ONE bounded counter
   for (let i = 0; i < 30; i++) assert.equal((await worker.fetch(getReq("/api/rro/pack?session_id=cs_test_RLW" + String(i).padStart(17, "0")), e)).status, 404);
   for (let i = 0; i < 5; i++) assert.equal((await worker.fetch(getReq("/rro/pack/success?session_id=cs_test_RLWOVER00000000001"), e)).status, 429);
   assert.equal(rows(), 0, "read paths must not insert rate-limit rows");
-  const ctr = db.prepare("SELECT bucket, n FROM rro_rate_counters").all();
-  assert.deepEqual(ctr.map((r) => [r.bucket, Number(r.n)]), [["pack_lookup", 30]], "one counter row, capped at the limit");
+  const ctr = db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='rro_rate_counters'").get().n ? db.prepare("SELECT COUNT(*) AS n FROM rro_rate_counters").get().n : 0;
+  assert.equal(ctr, 0, "unknown session ids never write a counter row");
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, "seed", "GET lookups must not purge");
   await worker.scheduled({}, e);
   assert.equal(db.prepare("SELECT ip_hash FROM rro_checkout_events WHERE session_id = ?").get("cs_test_OLDPURGE000000001").ip_hash, null);
