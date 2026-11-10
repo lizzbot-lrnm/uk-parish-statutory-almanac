@@ -1,11 +1,11 @@
-// node --test tests/  — P53: global daily ceiling on new Stripe Checkout sessions (fail closed, no Stripe call
+// node --test tests/  — P53/P68/P69: global daily ceiling on new Stripe Checkout sessions (fail closed, no Stripe call
 // over the cap or on a counter error), volume alerts, purge retention, paid buyers unaffected. No network.
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import worker from "../worker.js";
-import { rroCheckoutDailyCap, rroWindowStartIso, RRO_CHECKOUT_DAILY_CAP_DEFAULT, RRO_CHECKOUT_DAILY_WINDOW_MINUTES, RRO_ALERT_EVENT, RRO_CHECKOUT_SCHEMA } from "../src/rro_core.js";
+import { rroCheckoutDailyCap, rroWindowStartIso, rroResetIsolateStateForTests, RRO_CHECKOUT_DAILY_ALERT_STARTS, RRO_CHECKOUT_DAILY_CAP_DEFAULT, RRO_CHECKOUT_DAILY_WINDOW_MINUTES, RRO_ALERT_EVENT, RRO_CHECKOUT_SCHEMA } from "../src/rro_core.js";
 import { ORIGIN, configuredEnv, get, stripeCalls, mockStripe, noStripe, jsonResp, paidSession, seedStart, counters, withNow, captureLogs } from "./rro_batch_helpers.mjs";
 
 const PREVIEW_SECRET = "unit-test-preview-" + "secret-not-real-000000";
@@ -22,40 +22,75 @@ const stripeOk = () => mockStripe(() => { const id = "cs_test_P53SESSION" + Stri
 const alerts = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter((j) => j && j.event === RRO_ALERT_EVENT);
 const daily = (e) => counters(e).find((c) => c.bucket === "checkout_daily");
 
-test("P53: the cap is a named default (50), overridable by a plain var, and never 'unlimited' on bad input", () => {
-  assert.equal(RRO_CHECKOUT_DAILY_CAP_DEFAULT, 50);
-  assert.equal(rroCheckoutDailyCap({}), 50);
+test("P68: the cap is a named default (500), overridable by a plain var, and never 'unlimited' on bad input", () => {
+  assert.equal(RRO_CHECKOUT_DAILY_CAP_DEFAULT, 500);
+  assert.equal(RRO_CHECKOUT_DAILY_ALERT_STARTS, 20);
+  assert.equal(rroCheckoutDailyCap({}), 500);
   assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: "200" }), 200);
   assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: " 75 " }), 75);
   assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: 7 }), 7);
-  for (const bad of ["0", "-1", "abc", "1e3", "99999", "", "Infinity", "12.5", null, true]) assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: bad }), 50, String(bad));
+  for (const bad of ["0", "-1", "abc", "1e3", "99999", "Infinity", "12.5", true]) assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: bad }), 500, String(bad));
   const doc = readFileSync(new URL("../deploy/RRO_STRIPE_CHECKOUT.md", import.meta.url), "utf8");
   assert.match(doc, /`RRO_CHECKOUT_DAILY_CAP`/);
-  assert.match(doc, /The default is \*\*50\*\* new checkout sessions per UTC day/);
+  assert.match(doc, /The default is \*\*500\*\* new checkout sessions per UTC day/);
+  assert.match(doc, /\*\*20\*\* checkout starts/);
 });
 
-test("P53: over the daily cap -> generic 503, Stripe never called, cap-hit and volume alerts logged (throttled)", async () => {
-  const e = env({ RRO_CHECKOUT_DAILY_CAP: "4" });
+test("P69: an invalid RRO_CHECKOUT_DAILY_CAP logs ONE alert per isolate and still uses the default; unset stays silent", async () => {
+  rroResetIsolateStateForTests();
+  let logs = await captureLogs(async () => {
+    assert.equal(rroCheckoutDailyCap({}), 500);
+    assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: "" }), 500);
+    assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: null }), 500);
+  });
+  assert.equal(alerts(logs).length, 0, "unset is not invalid");
+  logs = await captureLogs(async () => {
+    for (let i = 0; i < 5; i++) assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: "lots-SECRETISH" }), 500);
+    assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: "0" }), 500);
+  });
+  const inv = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_invalid");
+  assert.equal(inv.length, 1, "one-time");
+  assert.equal(inv[0].using_default, 500);
+  assert.ok(!logs.join("\n").includes("lots-SECRETISH"), "raw value is not logged");
+  rroResetIsolateStateForTests();
+});
+
+test("P68: volume alert at an absolute 20 starts (throttled); over the cap -> 503, no Stripe call, cap hits escalate unthrottled", async () => {
+  rroResetIsolateStateForTests();
+  const e = env({ RRO_CHECKOUT_DAILY_CAP: "25" });
   stripeOk();
   let logs = await captureLogs(async () => {
-    for (let i = 0; i < 4; i++) assert.equal((await worker.fetch(checkout(), e)).status, 200, "#" + i);
+    for (let i = 0; i < 25; i++) assert.equal((await worker.fetch(checkout(), e)).status, 200, "#" + i);
   });
-  assert.equal(stripeCalls.length, 4);
+  assert.equal(stripeCalls.length, 25);
   const high = alerts(logs).filter((x) => x.alert === "checkout_daily_volume_high");
   assert.equal(high.length, 1, "throttled to one line");
-  assert.equal(high[0].n, 2, "first alert at 50% of the cap");
-  assert.equal(high[0].cap, 4);
-  let r;
-  logs = await captureLogs(async () => { r = await worker.fetch(checkout(), e); });
-  assert.equal(r.status, 503);
-  assert.deepEqual(await r.json(), { status: "error", error: "CHECKOUT_UNAVAILABLE" });
-  assert.equal(stripeCalls.length, 4, "no Stripe call over the cap");
-  const hit = alerts(logs).find((x) => x.alert === "checkout_daily_cap_hit");
-  assert.ok(hit && hit.cap === 4);
+  assert.equal(high[0].n, 20, "first alert at 20 starts, not a fraction of the cap");
+  assert.equal(high[0].cap, 25);
+  const rs = [];
+  logs = await captureLogs(async () => { for (let i = 0; i < 3; i++) rs.push(await worker.fetch(checkout(), e)); });
+  for (const r of rs) {
+    assert.equal(r.status, 503);
+    assert.deepEqual(await r.json(), { status: "error", error: "CHECKOUT_UNAVAILABLE" });
+  }
+  assert.equal(stripeCalls.length, 25, "no Stripe call over the cap");
+  const hits = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_hit");
+  assert.equal(hits.length, 3, "every cap hit is logged (unthrottled)");
+  assert.ok(hits.every((h) => h.cap === 25 && h.escalate === true && h.suppressed === undefined));
   const row = daily(e);
   assert.equal(row.key_hash, "global");
-  assert.equal(row.n, 4, "nothing written over the cap");
+  assert.equal(row.n, 25, "nothing written over the cap");
   assert.equal(row.window_start_utc, new Date().toISOString().slice(0, 10) + "T00:00:00.000Z", "window is the UTC day");
+});
+
+test("P68: a configured cap below 20 alerts at the cap itself", async () => {
+  rroResetIsolateStateForTests();
+  const e = env({ RRO_CHECKOUT_DAILY_CAP: "3" });
+  stripeOk();
+  const logs = await captureLogs(async () => { for (let i = 0; i < 3; i++) assert.equal((await worker.fetch(checkout(), e)).status, 200); });
+  const high = alerts(logs).filter((x) => x.alert === "checkout_daily_volume_high");
+  assert.equal(high.length, 1);
+  assert.equal(high[0].n, 3);
 });
 
 test("P53: a counter error fails closed for a new session (503, no Stripe call)", async () => {

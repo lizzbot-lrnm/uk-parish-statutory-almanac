@@ -7,7 +7,7 @@ import {
   RRO_PUBLIC_ORIGIN,
   RRO_CHECKOUT_RATE_LIMIT,
   RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
-  RRO_CHECKOUT_DAILY_ALERT_FRACTION,
+  RRO_CHECKOUT_DAILY_ALERT_STARTS,
   rroCheckoutDailyCap,
   rroD1CounterHitCount,
   RRO_PAID_CACHE_TTL_MS,
@@ -87,10 +87,10 @@ async function rroHandleCheckoutCreate(request, env) {
     return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
   }
   if (!dailyN) {
-    rroAlert("checkout_daily_cap_hit", { mode: mode.mode, cap: dailyCap });
+    rroAlert("checkout_daily_cap_hit", { mode: mode.mode, cap: dailyCap, escalate: true });
     return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
   }
-  if (dailyN >= Math.ceil(dailyCap * RRO_CHECKOUT_DAILY_ALERT_FRACTION)) {
+  if (dailyN >= Math.min(RRO_CHECKOUT_DAILY_ALERT_STARTS, dailyCap)) {
     rroAlert("checkout_daily_volume_high", { mode: mode.mode, n: dailyN, cap: dailyCap });
   }
   await rroPurgeIpHashes(db);

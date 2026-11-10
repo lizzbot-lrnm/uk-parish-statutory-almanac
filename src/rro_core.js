@@ -27,22 +27,31 @@ const RRO_PACK_PRICE_PENCE = 2400;
 const RRO_PACK_CURRENCY = "gbp";
 const RRO_PUBLIC_ORIGIN = "https://parish.technoplusit.co.uk";
 const RRO_CHECKOUT_RATE_LIMIT = { max_starts: 5, window_minutes: 10 };
-// P53: global ceiling on NEW Stripe Checkout sessions per UTC day (all IPs together), D1-counted in
-// rro_rate_counters (bucket checkout_daily, key global, window = the UTC day). Conservative launch default;
-// raise it by setting the plain var RRO_CHECKOUT_DAILY_CAP (an integer 1..10000; anything else falls back to
-// this default, never to "unlimited"). Over the cap, or on a counter error, checkout fails closed (503) and
-// Stripe is not called. Pack/success lookups (paid buyers) never touch this counter.
-const RRO_CHECKOUT_DAILY_CAP_DEFAULT = 50;
+// P53/P68: global ceiling on NEW Stripe Checkout sessions per UTC day (all IPs together), D1-counted in
+// rro_rate_counters (bucket checkout_daily, key global, window = the UTC day). P68 launch default: 500;
+// change it with the plain var RRO_CHECKOUT_DAILY_CAP (an integer 1..10000). An invalid value falls back to
+// this default, never to "unlimited", and (P69) logs a one-time alert per isolate. Over the cap, or on a
+// counter error, checkout fails closed (503) and Stripe is not called. Pack/success lookups (paid buyers)
+// never touch this counter.
+const RRO_CHECKOUT_DAILY_CAP_DEFAULT = 500;
 const RRO_CHECKOUT_DAILY_CAP_MAX = 10000;
 const RRO_CHECKOUT_DAILY_WINDOW_MINUTES = 24 * 60;
-// Volume alert (throttled by rroAlert) once the day's count reaches this fraction of the cap.
-const RRO_CHECKOUT_DAILY_ALERT_FRACTION = 0.5;
+// P68: volume alert (throttled by rroAlert) once the day's count reaches this ABSOLUTE number of starts
+// (or the cap, if a configured cap is lower). Cap hits are escalated and never throttled (see rroAlert).
+const RRO_CHECKOUT_DAILY_ALERT_STARTS = 20;
+let RRO_CAP_INVALID_ALERTED = false;
 function rroCheckoutDailyCap(env) {
   const raw = env && env.RRO_CHECKOUT_DAILY_CAP;
   const s = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
-  if (!/^[0-9]{1,5}$/.test(s)) return RRO_CHECKOUT_DAILY_CAP_DEFAULT;
-  const n = Number(s);
-  return n >= 1 && n <= RRO_CHECKOUT_DAILY_CAP_MAX ? n : RRO_CHECKOUT_DAILY_CAP_DEFAULT;
+  if (raw === undefined || raw === null || s === "") return RRO_CHECKOUT_DAILY_CAP_DEFAULT; // unset: no alert
+  const n = /^[0-9]{1,5}$/.test(s) ? Number(s) : NaN;
+  if (n >= 1 && n <= RRO_CHECKOUT_DAILY_CAP_MAX) return n;
+  // P69: never fall back silently. One line per isolate; the value itself is not logged (length/type only).
+  if (!RRO_CAP_INVALID_ALERTED) {
+    RRO_CAP_INVALID_ALERTED = true;
+    rroAlert("checkout_daily_cap_invalid", { using_default: RRO_CHECKOUT_DAILY_CAP_DEFAULT, allowed: "integer 1.." + RRO_CHECKOUT_DAILY_CAP_MAX, value_type: typeof raw, value_length: String(raw).length });
+  }
+  return RRO_CHECKOUT_DAILY_CAP_DEFAULT;
 }
 const RRO_LOOKUP_RATE_LIMIT = { max_hits: 30, window_minutes: 10 };
 const RRO_PAID_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -263,7 +272,8 @@ const RRO_ALERT_STATE = new Map();
 const RRO_ALERT_STATE_MAX_KEYS = 64;
 // P63: alerts about a real buyer's money are never throttled. They can only follow a verified (signed)
 // webhook or a Stripe-confirmed paid session, so an outsider cannot flood them.
-const RRO_ALERT_UNTHROTTLED = Object.freeze(new Set(["webhook_record_failed", "pack_record_failed", "webhook_paid_row_missing"]));
+// P68: checkout_daily_cap_hit is escalated the same way (it can only follow the per-IP limit and the D1 cap check).
+const RRO_ALERT_UNTHROTTLED = Object.freeze(new Set(["webhook_record_failed", "pack_record_failed", "webhook_paid_row_missing", "checkout_daily_cap_hit"]));
 function rroAlert(alert, fields, nowMs) {
   const key = String(alert);
   if (RRO_ALERT_UNTHROTTLED.has(key)) {
@@ -401,6 +411,7 @@ function rroNotPaidCacheDelete(sessionId) {
 
 // Test hook: forget per-isolate state (schema promise, lookup counters) between in-process test cases.
 function rroResetIsolateStateForTests() {
+  RRO_CAP_INVALID_ALERTED = false;
   RRO_CHECKOUT_SCHEMA_PROMISE = null;
   RRO_LOOKUP_LIMITER.clear();
   RRO_LOOKUP_INFLIGHT.clear();
@@ -753,7 +764,7 @@ export {
   RRO_CHECKOUT_DAILY_CAP_DEFAULT,
   RRO_CHECKOUT_DAILY_CAP_MAX,
   RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
-  RRO_CHECKOUT_DAILY_ALERT_FRACTION,
+  RRO_CHECKOUT_DAILY_ALERT_STARTS,
   rroCheckoutDailyCap,
   rroD1CounterHitCount,
   RRO_LOOKUP_RATE_LIMIT,

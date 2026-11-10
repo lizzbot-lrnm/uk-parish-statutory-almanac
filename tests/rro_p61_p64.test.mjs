@@ -11,7 +11,7 @@ const alerts = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch (
 // ---------------------------------------------------------------- P63
 test("P63: webhook_record_failed, pack_record_failed and webhook_paid_row_missing are never throttled; others still are", async () => {
   rroResetIsolateStateForTests();
-  assert.deepEqual([...RRO_ALERT_UNTHROTTLED].sort(), ["pack_record_failed", "webhook_paid_row_missing", "webhook_record_failed"]);
+  assert.deepEqual([...RRO_ALERT_UNTHROTTLED].sort(), ["checkout_daily_cap_hit", "pack_record_failed", "webhook_paid_row_missing", "webhook_record_failed"]);
   const t0 = 1_800_000_000_000;
   const logs = await captureLogs(async () => {
     for (let i = 0; i < 5; i++) {
