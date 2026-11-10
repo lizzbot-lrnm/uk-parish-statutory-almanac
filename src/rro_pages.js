@@ -56,7 +56,7 @@ function rroBuildFormalPack(session) {
   const role = inputs.party_role === "tenant_claim" ? "Applicant tenant(s) — RRO claim & quantum" : "Respondent landlord — s.44 mitigation & defence";
   const ref = String(session.id || "").slice(-10);
   const lines = [];
-  lines.push("# Formal Tribunal Appeal Pack — Rent Repayment Order (RRO)");
+  lines.push("# Formal Tribunal Application Pack — Rent Repayment Order (RRO)");
   lines.push("");
   lines.push("First-tier Tribunal (Property Chamber) — Residential Property · Housing and Planning Act 2016 ss.40–44");
   lines.push("");
@@ -66,7 +66,7 @@ function rroBuildFormalPack(session) {
   lines.push("- Tribunal region: " + inputs.region);
   lines.push("- Data: " + D.RRO_PRECEDENTS.length + " GOV.UK FTT (Property Chamber) RRO decisions, Open Government Licence v3.0");
   lines.push("");
-  lines.push("> Not legal advice. This pack is a deterministic, data-derived working bundle to support your own statement of case or appeal. Check every figure against your evidence and the full decision text before filing.");
+  lines.push("> Not legal advice. This pack is a deterministic, data-derived working bundle to support your own statement of case for an application to the First-tier Tribunal. Check every figure against your evidence and the full decision text before filing.");
   lines.push("");
   lines.push("## 1. Inputs");
   lines.push("");
@@ -191,11 +191,11 @@ function rroSuccessPageHtml(sessionId, session) {
   const testBanner = session && session.livemode === false
     ? '<p style="background:#fef3c7;border:1px solid #f59e0b;padding:10px;border-radius:6px;"><strong>Stripe TEST MODE</strong> — no real money was taken.</p>'
     : "";
-  return '<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Your Formal Tribunal Appeal Pack</title>' +
+  return '<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Your Formal Tribunal Application Pack</title>' +
     '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;color:#0f172a;line-height:1.5}a.btn{display:inline-block;margin:6px 8px 6px 0;padding:12px 16px;background:#1d4ed8;color:#fff;border-radius:8px;text-decoration:none;font-weight:600}a.sec{background:#475569}</style></head><body>' +
-    "<h1>Payment received — Export Formal Tribunal Appeal Pack</h1>" + testBanner +
+    "<h1>Payment received — Export Formal Tribunal Application Pack</h1>" + testBanner +
     "<p>Your pack is ready. Download links stay valid for " + RRO_PACK_DOWNLOAD_DAYS + " days from purchase; bookmark this page.</p>" +
-    '<p><a class="btn" href="/api/rro/pack?format=md&amp;session_id=' + sid + '">Download Formal Appeal Pack (Markdown)</a>' +
+    '<p><a class="btn" href="/api/rro/pack?format=md&amp;session_id=' + sid + '">Download Formal Application Pack (Markdown)</a>' +
     '<a class="btn sec" href="/api/rro/pack?format=csv&amp;session_id=' + sid + '">Download Schedule &amp; Precedents (CSV)</a></p>' +
     '<p><a href="/rro">&larr; Back to the RRO Precedent Finder</a></p>' +
     "<p style=\"font-size:13px;color:#64748b\">Not legal advice. Source data: GOV.UK First-tier Tribunal (Property Chamber), OGL v3.0.</p></body></html>";
@@ -233,7 +233,7 @@ async function rroHandleCheckoutRoutes(request, env, url) {
       const msg = loaded.error === "PAYMENT_NOT_COMPLETE"
         ? "Payment not completed yet. If you just paid, refresh in a few seconds."
         : "We could not verify this purchase right now. If you have paid, keep your Stripe receipt and try this link again later.";
-      return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Appeal Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Appeal Pack</h1><p>' + D.escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: loaded.status, headers: RRO_CHECKOUT_HTML_HEADERS });
+      return new Response('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Formal Tribunal Application Pack</title></head><body style="font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px"><h1>Formal Tribunal Application Pack</h1><p>' + D.escapeHtml(msg) + '</p><p><a href="/rro">Back to /rro</a></p></body></html>', { status: loaded.status, headers: RRO_CHECKOUT_HTML_HEADERS });
     }
     return new Response(rroSuccessPageHtml(sid, loaded.session), { headers: RRO_CHECKOUT_HTML_HEADERS });
   }
@@ -243,7 +243,7 @@ async function rroHandleCheckoutRoutes(request, env, url) {
     if (!loaded.ok) return rroJson({ status: "error", error: loaded.error }, loaded.status);
     const pack = rroBuildFormalPack(loaded.session);
     const fmt = String(url.searchParams.get("format") || "md").toLowerCase();
-    const base = "formal-tribunal-appeal-pack-" + pack.inputs.region.toLowerCase() + "-" + String(sid).slice(-8);
+    const base = "formal-tribunal-application-pack-" + pack.inputs.region.toLowerCase() + "-" + String(sid).slice(-8);
     if (fmt === "csv") {
       return new Response(pack.csv, { headers: { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": 'attachment; filename="' + base + '.csv"', "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
     }
@@ -256,9 +256,9 @@ async function rroHandleCheckoutRoutes(request, env, url) {
 //   live (review+owner gated) -> normal £24 CTA
 //   test + preview cookie/param -> CTA with an unmissable TEST MODE label
 //   test without preview, or not configured -> no CTA at all (production visitors never see test checkout)
-const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above. This is not legal advice and it does not file Form RRO1 for you.";
+const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; procedure checklist, built from the inputs above. This is not legal advice and it does not file Form RRO1 for you.";
 // Disabled state (keys unset): describe the optional pack, say plainly it cannot be bought yet. No button.
-const RRO_CTA_DISABLED_TEXT = "Optional Export Formal Tribunal Appeal Pack (£24): a formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and appeal checklist, built from the calculator inputs above. Checkout is not enabled on this page yet, so this pack cannot be purchased today. Searching and CSV download stay free. This is not legal advice.";
+const RRO_CTA_DISABLED_TEXT = "Optional Export Formal Tribunal Application Pack (£24): a formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and procedure checklist, built from the calculator inputs above. Checkout is not enabled on this page yet, so this pack cannot be purchased today. Searching and CSV download stay free. This is not legal advice.";
 
 // ---- SEO: visible FAQ + JSON-LD built from one source so the two always match word-for-word ----
 const RRO_PAGE_URL = "https://parish.technoplusit.co.uk/rro";
@@ -269,7 +269,7 @@ const RRO_FAQ = [
   ["Who can apply?", "A tenant, or a local housing authority, may apply (Housing and Planning Act 2016 s.41). In England, local housing authorities are district, unitary and London borough councils (and the City of London bodies named in Housing Act 2004 s.261) — not parish or town councils. A local housing authority may apply only in respect of housing in its area, after serving a notice of intended proceedings."],
   ["How much do tribunals award?", "In this index of 281 published decisions, the median award share shown on this page is 60% and the mean is 60.3%. That is a description of this dataset, not a guarantee or a recommended claim figure. Awards in individual cases range widely once utilities, Universal Credit / Housing Benefit, and other s.44 factors are taken into account."],
   ["What changed on 1 May 2026?", "For qualifying offences committed on or after 1 May 2026, official guidance describes a longer maximum repayment period (up to 24 months’ rent) and a longer period in which to apply (two years). Offences committed before that date can still be subject to the earlier rules (including a 12-month cap and a one-year application window). Check the date of the alleged offence against current GOV.UK guidance before relying on either figure."],
-  ["What is free, and what is the £24 pack?", "Searching the index, downloading a regional or filtered CSV of published decisions, using the s.44 calculator, and running the private claim check are free. The optional “Export Formal Tribunal Appeal Pack” is a one-off £24 Stripe Checkout export of a formal Scott Schedule, quantum workings, closest published comparables, a regional precedent bundle, and a grounds and appeal checklist, built from the calculator inputs. It is not legal advice, it is not Form RRO1, and it does not file an application for you. If checkout is not yet enabled on this page, the pack cannot be purchased."],
+  ["What is free, and what is the £24 pack?", "Searching the index, downloading a regional or filtered CSV of published decisions, using the s.44 calculator, and running the private claim check are free. The optional “Export Formal Tribunal Application Pack” is a one-off £24 Stripe Checkout export of a formal Scott Schedule, quantum workings, closest published comparables, a regional precedent bundle, and a grounds and procedure checklist, built from the calculator inputs. It is not legal advice, it is not Form RRO1, and it does not file an application for you. If checkout is not yet enabled on this page, the pack cannot be purchased."],
   ["Where does the data come from?", "The index is built from published First-tier Tribunal (Property Chamber) decisions on GOV.UK, reused under the Open Government Licence v3.0. It is not a complete record of every RRO ever made. Always open the official PDF linked from each row before relying on a case."],
 ];
 function rroFaqHtml() {
@@ -294,8 +294,8 @@ function rroJsonLd(ctaState) {
     {
       "@type": "Product",
       "@id": RRO_PAGE_URL + "#formal-pack",
-      name: "Export Formal Tribunal Appeal Pack",
-      description: "Optional one-off export built from the calculator inputs: formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and appeal checklist. Not legal advice; not Form RRO1.",
+      name: "Export Formal Tribunal Application Pack",
+      description: "Optional one-off export built from the calculator inputs: formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and procedure checklist. Not legal advice; not Form RRO1.",
       url: RRO_PAGE_URL,
       offers: {
         "@type": "Offer",
@@ -340,11 +340,11 @@ async function rroRenderRroPage(request, env, url) {
   note = '<p id="formalPackComingSoon" style="font-size:13px;color:#475569;margin:6px 0 0;">' + RRO_CTA_DISABLED_TEXT + "</p>";
   if (configured && mode.mode === "live") {
     state = "live";
-    button = '<button id="formalPackBtn" type="button" style="background:#1d4ed8;">Export Formal Tribunal Appeal Pack — £24</button>';
+    button = '<button id="formalPackBtn" type="button" style="background:#1d4ed8;">Export Formal Tribunal Application Pack — £24</button>';
     note = '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">' + RRO_CTA_NOTE_TEXT + "</p>";
   } else if (configured && mode.mode === "test" && preview) {
     state = "test_preview";
-    button = '<button id="formalPackBtn" type="button" style="background:#b45309;">[TEST MODE] Export Formal Tribunal Appeal Pack — £24</button>';
+    button = '<button id="formalPackBtn" type="button" style="background:#b45309;">[TEST MODE] Export Formal Tribunal Application Pack — £24</button>';
     note =
       '<p id="rroTestModeBanner" role="alert" style="background:#fef3c7;border:2px solid #b45309;color:#78350f;padding:8px 10px;border-radius:6px;font-weight:700;margin:8px 0 0;">' +
       RRO_TEST_MODE_LABEL + ".</p>" +

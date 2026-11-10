@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Stripe Checkout: "Export Formal Tribunal Appeal Pack" (£24)
+// Stripe Checkout: "Export Formal Tribunal Application Pack" (£24)
 // Hosted Checkout Session redirect only.
 //
 // Day-7 falsification rule (full telemetry only):
@@ -22,7 +22,7 @@
 // TODO(live-gate L1–L11): see deploy/RRO_STRIPE_CHECKOUT.md "Live gate checklist". NOT in this pass.
 // ---------------------------------------------------------------------------
 const RRO_PACK_PRODUCT_KEY = "tribunal_appeal_pack";
-const RRO_PACK_PRODUCT_NAME = "Export Formal Tribunal Appeal Pack";
+const RRO_PACK_PRODUCT_NAME = "Export Formal Tribunal Application Pack";
 const RRO_PACK_PRICE_PENCE = 2400;
 const RRO_PACK_CURRENCY = "gbp";
 const RRO_PUBLIC_ORIGIN = "https://parish.technoplusit.co.uk";
@@ -37,7 +37,7 @@ const RRO_DAY7_RULE = Object.freeze({
   window_days: 7,
   min_checkout_starts: 10,
   min_paid: 1,
-  rule: "At day 7 after RRO_CHECKOUT_LIVE_SINCE: checkout_starts < 10 OR paid == 0 -> kill the £24 Formal Tribunal Appeal Pack",
+  rule: "At day 7 after RRO_CHECKOUT_LIVE_SINCE: checkout_starts < 10 OR paid == 0 -> kill the £24 Formal Tribunal Application Pack",
 });
 const RRO_SESSION_ID_RE = /^cs_(test|live)_[A-Za-z0-9]{10,240}$/;
 const RRO_CHECKOUT_SCHEMA = [

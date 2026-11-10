@@ -62,7 +62,7 @@ for (const [label, over] of DISABLED) {
       assert.equal(r.status, 200);
       assert.equal(r.headers.get("X-RRO-CTA"), "hidden");
       const html = await r.text();
-      assert.match(html, /id="formalPackComingSoon"[^>]*>Optional Export Formal Tribunal Appeal Pack \(£24\):[^<]*Checkout is not enabled on this page yet, so this pack cannot be purchased today\./);
+      assert.match(html, /id="formalPackComingSoon"[^>]*>Optional Export Formal Tribunal Application Pack \(£24\):[^<]*Checkout is not enabled on this page yet, so this pack cannot be purchased today\./);
       assert.doesNotMatch(html, /id="formalPackBtn"/);
       assert.doesNotMatch(html, /£29|rro-buy-pack|rro\/buy-pack/);
       // No link or form out to Stripe (the inline script only has an allow-list check for a returned URL).

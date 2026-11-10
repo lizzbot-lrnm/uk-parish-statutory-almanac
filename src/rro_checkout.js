@@ -80,7 +80,7 @@ async function rroHandleCheckoutCreate(request, env) {
     "line_items[0][price_data][unit_amount]": String(RRO_PACK_PRICE_PENCE),
     "line_items[0][price_data][product_data][name]": RRO_PACK_PRODUCT_NAME,
     "line_items[0][price_data][product_data][description]":
-      "Formal First-tier Tribunal (Property Chamber) RRO appeal pack: Scott Schedule, quantum workings, comparable GOV.UK precedents and s.44 grounds checklist.",
+      "Formal First-tier Tribunal (Property Chamber) RRO application pack: Scott Schedule, quantum workings, comparable GOV.UK precedents and s.44 grounds checklist.",
     success_url: RRO_PUBLIC_ORIGIN + "/rro/pack/success?session_id={CHECKOUT_SESSION_ID}",
     cancel_url: RRO_PUBLIC_ORIGIN + "/rro?checkout=cancelled",
     "metadata[product]": RRO_PACK_PRODUCT_KEY,
