@@ -1004,3 +1004,26 @@ test("P27/P28: no customer-facing output says 'appeal pack' or 'North Star' (all
   const md = await worker.fetch(getReq("/api/rro/pack?format=md&session_id=" + session.id), e);
   assertClean("pack markdown + filename", (await md.text()) + md.headers.get("Content-Disposition"));
 });
+
+// ---------------------------------------------------------------- P31: the paid pack CSV is formula-safe even with hostile session metadata
+test("P31: pack CSV and filename neutralise/reject hostile metadata (region, mitigation, numbers)", async () => {
+  const EVIL = '=HYPERLINK("http://evil.example","x")';
+  const e = env();
+  const base = paidSession("cs_test_P31PACKCSV000000001");
+  const session = { ...base, metadata: { ...base.metadata, region: EVIL, mitigation_factors: EVIL + ",first_offence", monthly_rent_gbp: "=1+1", months_unlicensed: "-3" } };
+  seedStart(e, session.id);
+  mockStripe(() => jsonResp(session));
+  const r = await worker.fetch(getReq("/api/rro/pack?format=csv&session_id=" + session.id), e);
+  assert.equal(r.status, 200);
+  const csv = await r.text();
+  assert.doesNotMatch(csv, /HYPERLINK|evil\.example/);
+  assert.match(r.headers.get("Content-Disposition"), /filename="formal-tribunal-application-pack-london-/);
+  for (const line of csv.split(/\r?\n/)) {
+    if (line.startsWith("#") || line === "") continue;
+    for (const cell of line.split(",")) {
+      const c = cell.replace(/^"/, "");
+      if (/^-?\d+(\.\d+)?$/.test(c)) continue;
+      assert.doesNotMatch(c, /^[=+\-@\t\r]/, "formula-like cell " + c.slice(0, 40));
+    }
+  }
+});
