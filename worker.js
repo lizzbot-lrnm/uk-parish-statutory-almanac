@@ -2885,39 +2885,8 @@ export default {
       return Response.json(calcRes, { headers: corsHeaders });
     }
 
-    if (
-      url.pathname === "/api/rro-buy-pack" ||
-      url.pathname === "/api/rro/buy-pack" ||
-      url.pathname === "/api/rro/buy-pack/"
-    ) {
-      const region = url.searchParams.get("region") || "London";
-      const partyRole = url.searchParams.get("party_role") || url.searchParams.get("role") || "landlord_defence";
-      const stats = await recordRroEdgeEvent("buy_pack_click", isInternal);
-      return Response.json(
-        {
-          status: "ok",
-          checkout_mode: "intent_validation_smoke_test_instant_sample",
-          product: "UK Property Tribunal RRO Complete Regional Defence & Precedent Dossier Pack",
-          price_gbp: 29,
-          region,
-          party_role: partyRole,
-          internal_smoke_test: isInternal,
-          included_deliverables: [
-            "Full 281-decision GOV.UK First-tier Tribunal (Property Chamber) RRO dataset (CSV + JSON) with award_source provenance",
-            "Custom Section 44 Mitigation & Acheampong Utility Deduction Scott Schedule (Markdown + CSV)",
-            "Verbatim Judicial Reasoning Dossier across all 5 UK Tribunal Regions (OGL v3.0)",
-            "Renters' Rights Act 2026 (1-to-24-month cap) Statutory Defence & Claim Checklist",
-          ],
-          instant_sample_pack_url: "https://parish.technoplusit.co.uk/api/rro-search?format=csv",
-          instant_schedule_url: "https://parish.technoplusit.co.uk/api/rro-calculate?region=" + encodeURIComponent(region) + "&format=markdown",
-          telemetry_snapshot: {
-            total_buy_pack_clicks: stats.total_buy_pack_clicks,
-            internal_smoke_tests: stats.internal_smoke_tests,
-          },
-        },
-        { headers: corsHeaders }
-      );
-    }
+    // L9: the legacy £29 intent-validation offer (/api/rro-buy-pack, /api/rro/buy-pack) is removed;
+    // those paths now fall through to the normal 404. The only paid product is the £24 pack (src/rro_pages.js).
 
     if (
       url.pathname === "/api/rro-audit-pdf" ||

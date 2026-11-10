@@ -6,6 +6,7 @@ import {
   RRO_PACK_DOWNLOAD_DAYS,
   RRO_SESSION_ID_RE,
   rroStripeMode,
+  rroWebhookSecret,
   rroEnsureCheckoutSchema,
   rroJson,
   rroIpPepper,
@@ -258,12 +259,15 @@ async function rroHandleCheckoutRoutes(request, env, url) {
 const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above.";
 async function rroRenderRroPage(request, env, url) {
   const mode = rroStripeMode(env);
-  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && env.STRIPE_WEBHOOK_SECRET && rroIpPepper(env));
+  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && rroWebhookSecret(env) && rroIpPepper(env));
   const viaLink = await rroPreviewLinkValid(url, env);
   const preview = viaLink || (await rroPreviewCookieValid(request, env));
   let button = "";
   let note = "";
   let state = "hidden";
+  // Default (no usable Stripe test config, or a test key without preview): a plain "coming soon"
+  // notice. No button, no link, no checkout call; X-RRO-CTA stays "hidden".
+  note = '<p id="formalPackComingSoon" style="font-size:13px;color:#475569;margin:6px 0 0;">Formal Tribunal Appeal Pack (£24): checkout coming soon.</p>';
   if (configured && mode.mode === "live") {
     state = "live";
     button = '<button id="formalPackBtn" type="button" style="background:#1d4ed8;">Export Formal Tribunal Appeal Pack — £24</button>';

@@ -21,7 +21,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 | Name | Kind | Notes |
 |---|---|---|
 | `STRIPE_SECRET_KEY` | Worker secret | `sk_test_…`/`rk_test_…` first. A live key is **refused** unless `RRO_STRIPE_LIVE_ENABLED=true`. A restricted key needs Checkout Sessions: write. |
-| `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Checkout fails closed without it. |
+| `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Must be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
 | `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
 | `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Checkout and pack lookups return `503 CHECKOUT_NOT_CONFIGURED` without it. Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
@@ -39,7 +39,7 @@ The Stripe webhook likewise returns `503 {"error":"WEBHOOK_NOT_CONFIGURED"}` and
 |---|---|
 | Live (exact flag + live key + security review + owner approval) | Normal "Export Formal Tribunal Appeal Pack — £24" CTA |
 | Test key, visitor has preview | Amber "[TEST MODE] …" button plus banner **"TEST MODE – no real payment; do not enter real card details."** Stripe Checkout also shows that text above the pay button (`custom_text[submit]`). |
-| Test key, no preview / not configured | **No CTA at all.** Real visitors never reach a Stripe test checkout. |
+| Test key, no preview / not configured | **No CTA at all**, only the plain text "Formal Tribunal Appeal Pack (£24): checkout coming soon." (no button, no link, no Stripe call; `X-RRO-CTA: hidden`). Real visitors never reach a Stripe test checkout. |
 
 Preview (signed, key holder only): the link token is `<exp>.<HMAC-SHA256(RRO_PREVIEW_SECRET, "rro-preview-link-v2:" + exp)>` (hex), where `exp` is a unix time no more than 24h ahead; the expiry is inside the HMAC, so it can't be extended. Compute it locally with `exp=$(( $(date +%s) + 86400 )); echo "$exp.$(printf 'rro-preview-link-v2:%s' "$exp" | openssl dgst -sha256 -hmac "$RRO_PREVIEW_SECRET" | awk '{print $NF}')"` (never paste the secret or token in chat, notes or logs). Expired links, links more than 24h ahead and the old static v1 token are refused. The Worker never logs the token; Cloudflare's own request logs can still record the query string, which is why the link expires. Opening `/rro?rro_preview=<token>` returns a 302 to `/rro` (so the token leaves the URL bar, history and Referer; `Referrer-Policy: no-referrer` on `/rro`) and sets an `HttpOnly; Secure; SameSite=Lax` cookie (Lax so it survives Stripe's cancel redirect back to `/rro`; the checkout POST is still Origin-checked) `rro_preview=<exp>.<HMAC(secret, "rro-preview-cookie-v1:"+exp)>` valid 24h. Unsigned, forged, expired or wrong-key cookies are ignored, and if `RRO_PREVIEW_SECRET` is missing (or under 24 chars) preview fails closed: no CTA and `POST /api/rro/checkout` in test mode returns 503. Preview responses are `Cache-Control: private, no-store`; header `X-RRO-CTA` reports `live` / `test_preview` / `hidden`.
 
@@ -48,6 +48,9 @@ Preview (signed, key holder only): the link token is `<exp>.<HMAC-SHA256(RRO_PRE
 
 ## Base branch
 The base branch is **`main`**. PR [#2](https://github.com/lizzbot-lrnm/uk-parish-statutory-almanac/pull/2) (`daneel/rro-checkout-test`) targets `main` directly and contains only the checkout change; it supersedes PR #1 (`feat/idea03-stripe-checkout`), which is not a base for anything. Local checkouts should track `origin/daneel/rro-checkout-test` (`git branch --set-upstream-to=origin/daneel/rro-checkout-test`) and be compared against `origin/main`.
+
+## TC2: rate-hit purge index
+`ix_rro_rate_hits_created_at ON rro_rate_hits(created_at_utc)` is in `migrations/0002_rro_rate_hits_created_at.sql` and the lazy schema, so the retention `DELETE … WHERE created_at_utc < ?` (full and bounded) uses an index instead of a table scan (`tests/rro_disabled_state.test.mjs` checks the query plan).
 
 ## Idempotency and caching
 - Each `/rro` view that shows the CTA sets `rro_bn`, a random 128-bit `HttpOnly; Secure; SameSite=Lax` cookie (24h), unless a valid one already exists. The Stripe `Idempotency-Key` is SHA-256 of mode, daily `ip_hash`, that nonce, the sorted cleaned inputs and a 10-minute bucket, so a retry or double submit from one browser reuses one Checkout Session, while two browsers behind one IP never share one. With no valid nonce, each request gets a fresh random key (no dedupe).
@@ -65,7 +68,7 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - [ ] L6 Product rename review
 - [ ] L7 Note that the underlying OGL data is free
 - [ ] L8 Estimate wording review
-- [ ] L9 Remove the legacy £29 intent-validation offer (`/api/rro/buy-pack`)
+- [x] L9 Remove the legacy £29 intent-validation offer (`/api/rro-buy-pack`, `/api/rro/buy-pack`): removed; those paths now 404
 - [ ] L10 Day-7 rule counts paid orders only and has a named owner
 - [x] L11 Hourly cron trigger for the 48h `ip_hash` purge is now mandatory and set by the deploy build (see T3)
 
@@ -75,7 +78,7 @@ All must be done, plus a fresh security review, owner approval and a separate li
 3. Smoke: the build's own post-deploy check must report `crons` containing `0 * * * *` (it throws otherwise). `curl https://parish.technoplusit.co.uk/api/rro/telemetry` → `{"status":"ok",…,"mode":"test"}`. `/rro` without preview → no CTA (`X-RRO-CTA: hidden`). `/rro?rro_preview=1` → still hidden (unsigned). `/rro?rro_preview=<signed token>` → TEST MODE CTA. From that preview browser, pay with a Stripe test card (4242…), then check `paid` increments via full telemetry (bearer).
 
 ## Tests
-`node --test tests/rro_checkout.test.mjs` (Node ≥ 22, uses `node:sqlite` as a D1 stand-in; Stripe is mocked).
+`node --test tests/*.test.mjs` (Node ≥ 22, uses `node:sqlite` as a D1 stand-in; Stripe is mocked). `tests/rro_disabled_state.test.mjs` proves the disabled state: with no (or malformed) Stripe env, `/rro` shows "checkout coming soon", checkout and the webhook return 503, and no request to stripe.com is made.
 
 ## Public surface hardening
 - `/api/rro/stats` (and `/rro/stats`, `/api/rro-stats`) needs `Authorization: Bearer <RRO_TELEMETRY_TOKEN>` (401 otherwise); the `/rro` page, sitemap and endpoint list no longer link to it.

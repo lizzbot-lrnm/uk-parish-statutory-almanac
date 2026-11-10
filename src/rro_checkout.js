@@ -14,6 +14,7 @@ import {
   RRO_OPPORTUNISTIC_PURGE_LIMIT,
   rroPurgeIpHashesBounded,
   rroStripeMode,
+  rroWebhookSecret,
   rroEnsureCheckoutSchema,
   rroJson,
   rroIpPepper,
@@ -36,7 +37,7 @@ async function rroHandleCheckoutCreate(request, env) {
   if (!rroOriginAllowed(request)) return rroJson({ status: "error", error: "ORIGIN_NOT_ALLOWED" }, 403);
   // T5 / W-L3: one generic error for every misconfiguration; no reason/env/binding names in the body.
   const mode = rroStripeMode(env);
-  if (!mode.ok || !env.RRO_CHECKOUT_DB || !env.STRIPE_WEBHOOK_SECRET || !rroIpPepper(env)) {
+  if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroWebhookSecret(env) || !rroIpPepper(env)) {
     return rroJson({ status: "error", error: "CHECKOUT_NOT_CONFIGURED" }, 503);
   }
   // T1: test-mode checkout is preview-only so unaware real visitors never land on a Stripe test page.
@@ -139,12 +140,12 @@ async function rroHandleStripeWebhook(request, env) {
   if (request.method !== "POST") return rroJson({ status: "error", error: "METHOD_NOT_ALLOWED" }, 405, { Allow: "POST" });
   // Fail closed: no usable Stripe key (missing, unrecognised or live-blocked), no whsec, or no DB -> 503.
   const mode = rroStripeMode(env);
-  if (!mode.ok || !env.STRIPE_WEBHOOK_SECRET || !env.RRO_CHECKOUT_DB) return rroJson({ status: "error", error: "WEBHOOK_NOT_CONFIGURED" }, 503);
+  if (!mode.ok || !rroWebhookSecret(env) || !env.RRO_CHECKOUT_DB) return rroJson({ status: "error", error: "WEBHOOK_NOT_CONFIGURED" }, 503);
   // W-L2: bounded streaming read (declared Content-Length refused first; header-less bodies cut off at 256 KiB).
   const webhookBody = await rroReadCappedBody(request, 256 * 1024);
   if (!webhookBody.ok) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
   const rawBody = webhookBody.text;
-  const ver = await rroVerifyStripeSignature(rawBody, request.headers.get("Stripe-Signature"), env.STRIPE_WEBHOOK_SECRET);
+  const ver = await rroVerifyStripeSignature(rawBody, request.headers.get("Stripe-Signature"), rroWebhookSecret(env));
   if (!ver.ok) return rroJson({ status: "error", error: "SIGNATURE_VERIFICATION_FAILED" }, 400);
   let event;
   try {
@@ -233,7 +234,7 @@ async function rroBuildTelemetry(env, nowMs) {
 // key-presence (live_blocked collapses to "unavailable"), no env/binding names, no kill-rule internals.
 function rroPublicTelemetry(env) {
   const mode = rroStripeMode(env);
-  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && env.STRIPE_WEBHOOK_SECRET && rroIpPepper(env));
+  const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && rroWebhookSecret(env) && rroIpPepper(env));
   return {
     status: "ok",
     product: RRO_PACK_PRODUCT_KEY,
