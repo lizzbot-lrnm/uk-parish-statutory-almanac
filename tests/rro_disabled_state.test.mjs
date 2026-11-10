@@ -145,8 +145,10 @@ test("rroWebhookSecret only accepts whsec_-shaped values from env", () => {
   assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: "" }), null);
   assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: "whsec_short" }), null);
   assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: "sk_test_" + "FAKEFAKEFAKE0123456789" }), null);
-  assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: " whsec_" + "unit_test_only_not_a_real_secret" }), null);
   const ok = "whsec_" + "unit_test_only_not_a_real_secret";
+  // P5: surrounding whitespace is trimmed before the shape check (see tests/rro_body_caps_trim.test.mjs).
+  assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: " " + ok }), ok);
+  assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: "whsec_ " + "unit_test_only_not_a_real_secret" }), null);
   assert.equal(rroWebhookSecret({ STRIPE_WEBHOOK_SECRET: ok }), ok);
 });
 

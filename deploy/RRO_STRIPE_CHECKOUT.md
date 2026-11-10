@@ -21,7 +21,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 | Name | Kind | Notes |
 |---|---|---|
 | `STRIPE_SECRET_KEY` | Worker secret | `sk_test_…`/`rk_test_…` first. A live key is **refused** unless `RRO_STRIPE_LIVE_ENABLED=true`. A restricted key needs Checkout Sessions: write. |
-| `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Must be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
+| `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Leading/trailing whitespace or a newline is trimmed (as for `STRIPE_SECRET_KEY`); it must then be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
 | `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
 | `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Checkout and pack lookups return `503 CHECKOUT_NOT_CONFIGURED` without it. Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
@@ -84,6 +84,7 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - `/api/rro/stats` (and `/rro/stats`, `/api/rro-stats`) needs `Authorization: Bearer <RRO_TELEMETRY_TOKEN>` (401 otherwise); the `/rro` page, sitemap and endpoint list no longer link to it.
 - `POST /api/rro-audit-pdf`, `POST /api/apify-mcp-lint` and `POST /mcp` refuse bodies over 64 KB with 413 (declared `Content-Length` checked first, then a bounded streamed read).
 - `/rro` and the claim-check response use plain user-facing wording (`privacy_note`, `data_source`); internal implementation terms and field names are not exposed.
+- `POST /api/rro-search` and `POST /api/rro-calculate` (and their `/api/rro/search`, `/api/rro/calculate` aliases) refuse bodies over **16 KiB** with 413 `{"status":"error","error":"PAYLOAD_TOO_LARGE","max_bytes":16384}` (declared `Content-Length` first, then a bounded streamed count, so chunked or mis-declared bodies are cut off just past the cap). A full POST with every field is ~350 bytes.
 - `POST /api/rro/checkout` (4 KB) and the Stripe webhook (256 KiB) use the same bounded streaming read, so a body without `Content-Length` is cut off at the cap (413). `POST /api/pdf-clause-extract` has the 64 KB cap too.
 - Pack lookups are serialised per limiter key inside an isolate and the count is re-read after the cache read, so parallel requests cannot all pass on one stale count.
 - A pack lookup refuses a Stripe session whose `livemode` disagrees with the key mode (502, nothing recorded), matching the webhook check.

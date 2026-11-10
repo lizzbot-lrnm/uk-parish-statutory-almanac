@@ -57,8 +57,15 @@ let RRO_CHECKOUT_SCHEMA_PROMISE = null;
 const RRO_INTERNAL_CACHE_PREFIX = "https://parish.technoplusit.co.uk/__rro_internal_cache/v1/";
 const RRO_OPPORTUNISTIC_PURGE_LIMIT = 500;
 
+// P5: secrets pasted with a stray space or newline are trimmed before the shape check, and the
+// trimmed value is the one sent to Stripe. Anything still malformed after trimming stays refused.
+function rroStripeSecretKey(env) {
+  const v = env && env.STRIPE_SECRET_KEY;
+  return typeof v === "string" ? v.trim() : "";
+}
+
 function rroStripeMode(env) {
-  const key = String((env && env.STRIPE_SECRET_KEY) || "");
+  const key = rroStripeSecretKey(env);
   if (!key) return { ok: false, mode: "unconfigured", reason: "STRIPE_SECRET_KEY_MISSING" };
   if (/^(sk|rk)_test_[A-Za-z0-9]+$/.test(key)) return { ok: true, mode: "test" };
   if (/^(sk|rk)_live_[A-Za-z0-9]+$/.test(key)) {
@@ -73,8 +80,9 @@ function rroStripeMode(env) {
 // treated as missing, so checkout stays disabled and the webhook answers 503 (fail closed).
 const RRO_WEBHOOK_SECRET_RE = /^whsec_[A-Za-z0-9_+/=-]{16,}$/;
 function rroWebhookSecret(env) {
-  const s = env && env.STRIPE_WEBHOOK_SECRET;
-  return typeof s === "string" && RRO_WEBHOOK_SECRET_RE.test(s) ? s : null;
+  const raw = env && env.STRIPE_WEBHOOK_SECRET;
+  const s = typeof raw === "string" ? raw.trim() : "";
+  return RRO_WEBHOOK_SECRET_RE.test(s) ? s : null;
 }
 
 function rroEnsureCheckoutSchema(db) {
@@ -188,7 +196,8 @@ function rroJson(body, status, extraHeaders) {
 function rroIpPepper(env) {
   const pepper = typeof (env && env.RRO_IP_PEPPER) === "string" ? env.RRO_IP_PEPPER : "";
   if (pepper.length < 16) return null;
-  if (env.STRIPE_WEBHOOK_SECRET && pepper === env.STRIPE_WEBHOOK_SECRET) return null;
+  const whsec = typeof env.STRIPE_WEBHOOK_SECRET === "string" ? env.STRIPE_WEBHOOK_SECRET.trim() : "";
+  if (whsec && (pepper === env.STRIPE_WEBHOOK_SECRET || pepper.trim() === whsec)) return null;
   return pepper;
 }
 
@@ -393,7 +402,7 @@ async function rroCheckoutIdempotencyKey(mode, ipHash, nonce, inputs, nowSec = D
 
 async function rroStripeRequest(env, method, path, form, idempotencyKey) {
   const headers = {
-    Authorization: "Bearer " + env.STRIPE_SECRET_KEY,
+    Authorization: "Bearer " + rroStripeSecretKey(env),
     "Stripe-Version": "2024-06-20",
   };
   let body;
@@ -441,6 +450,7 @@ export {
   rroPurgeIpHashesBounded,
   rroResetIsolateStateForTests,
   rroStripeMode,
+  rroStripeSecretKey,
   rroWebhookSecret,
   rroEnsureCheckoutSchema,
   rroJson,
