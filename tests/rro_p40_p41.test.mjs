@@ -76,6 +76,7 @@ function runDeploy(src, bindingsBefore, bindingsAfter = bindingsBefore) {
     calls.push(method + " " + path);
     if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
       if (path.endsWith("/deployments") && method === "GET") return { success: true, result: { deployments: [{ id: "d-prev", versions: [{ version_id: "v-prev", percentage: 100 }] }] } };
+    if (path.endsWith("/script-settings")) return method === "PATCH" ? { success: true, result: {} } : { success: true, result: { observability: { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } } } };
     if (path.endsWith("/settings")) return { success: true, result: { bindings: settingsReads++ === 0 ? bindingsBefore : bindingsAfter } };
     if (path.endsWith("/schedules") && method === "PUT") { schedules = body; return { success: true, result: { schedules } }; }
     if (path.endsWith("/schedules")) return { success: true, result: { schedules } };

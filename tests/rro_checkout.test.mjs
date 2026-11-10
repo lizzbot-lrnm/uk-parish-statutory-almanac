@@ -797,6 +797,7 @@ test("G4: the deploy build registers the mandatory hourly cron, keeps existing o
     const cloudflare = { request: async ({ method, path, body }) => {
       calls.push(method + " " + path);
       if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
+      if (path.endsWith("/script-settings")) return method === "PATCH" ? { success: true, result: {} } : { success: true, result: { observability: { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } } } };
       if (path.endsWith("/settings")) return { success: true, result: { bindings: [{ type: "secret_text", name: "RRO_IP_PEPPER" }] } };
       if (path.endsWith("/deployments") && method === "GET") return { success: true, result: { deployments: [{ id: "d-prev", versions: [{ version_id: "v-prev", percentage: 100 }] }] } };
       if (path.endsWith("/schedules") && method === "PUT") { schedules = verifyDrops ? [] : body; return { success: true, result: { schedules } }; }

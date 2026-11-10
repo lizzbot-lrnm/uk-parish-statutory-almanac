@@ -50,6 +50,15 @@ process.stdout.write(`async () => {
     const rb = await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\`, body: { strategy: "percentage", versions: [{ version_id: prevVersion, percentage: 100 }], annotations: { "workers/message": "auto-rollback: " + why } } });
     return rb && rb.success === true ? "rolled back to " + prevVersion : "ROLLBACK FAILED (" + JSON.stringify({ errors: (rb && rb.errors) || [] }) + "): roll back to " + prevVersion + " by hand";
   };
+  const OBSERVABILITY = { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } };
+  const obsMismatch = (o) => {
+    const bad = [];
+    const want = [["enabled", (x) => x.enabled === true], ["head_sampling_rate", (x) => Number(x.head_sampling_rate) === 1], ["redact_query_string", (x) => x.redact_query_string === true],
+      ["logs.enabled", (x) => !!x.logs && x.logs.enabled === true], ["logs.invocation_logs", (x) => !!x.logs && x.logs.invocation_logs === false],
+      ["logs.head_sampling_rate", (x) => !!x.logs && Number(x.logs.head_sampling_rate) === 1], ["traces.enabled", (x) => !x.traces || x.traces.enabled !== true]];
+    for (const [k, f] of want) if (!o || !f(o)) bad.push(k);
+    return bad;
+  };
   const list = ok(await cloudflare.request({ method: "GET", path: \`/accounts/\${accountId}/d1/database\`, query: { name: DB_NAME } }), "list D1");
   let db = (list || []).find((d) => d.name === DB_NAME);
   if (!db) db = ok(await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/d1/database\`, body: { name: DB_NAME } }), "create D1");
@@ -61,6 +70,7 @@ process.stdout.write(`async () => {
     compatibility_flags: (settings && settings.compatibility_flags) || [],
     bindings: [...existing, { type: "d1", name: "RRO_CHECKOUT_DB", id: db.uuid }],
     keep_bindings: KEEP_TYPES,
+    observability: { enabled: true, head_sampling_rate: 1, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } },
     annotations: { "workers/message": ${JSON.stringify(message)} }
   };
   const form = new FormData();
@@ -76,6 +86,18 @@ process.stdout.write(`async () => {
     throw new Error("smoke: secret names changed: " + JSON.stringify(secretsBefore) + " -> " + JSON.stringify(secretsAfter) + "; STOP, " + (await rollBack("secret names changed during deploy")));
   }
   // Retention cron is mandatory (T3): keep any existing schedules, ensure the hourly purge, then read it back.
+  // P61: the deploy sets the Workers Logs privacy config itself and checks it after upload. Invocation logs
+  // (visitor IP, user-agent, city/postcode, lat/long) stay OFF; query strings redacted; traces off.
+  // Any mismatch (or a failed write/read) = STOP and roll back to the previous version.
+  const OBS_PATH = \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/script-settings\`;
+  let obsErr = null, obsGot = null;
+  try {
+    ok(await cloudflare.request({ method: "PATCH", path: OBS_PATH, body: { observability: OBSERVABILITY } }), "set observability");
+    obsGot = (ok(await cloudflare.request({ method: "GET", path: OBS_PATH }), "read observability") || {}).observability || null;
+    const bad = obsMismatch(obsGot);
+    if (bad.length) obsErr = "observability mismatch: " + bad.join(", ");
+  } catch (e) { obsErr = String((e && e.message) || e); }
+  if (obsErr) throw new Error("smoke: " + obsErr + "; STOP, " + (await rollBack("observability config check failed")) + " (script-level logs settings are not versioned: re-check them by hand)");
   const SCHEDULES = \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/schedules\`;
   const before = ok(await cloudflare.request({ method: "GET", path: SCHEDULES }), "read schedules");
   const crons = ((before && before.schedules) || []).map((s) => s.cron).filter(Boolean);
@@ -84,6 +106,6 @@ process.stdout.write(`async () => {
   const after = ok(await cloudflare.request({ method: "GET", path: SCHEDULES }), "verify schedules");
   const registered = ((after && after.schedules) || []).map((s) => s.cron);
   if (!registered.includes(RETENTION_CRON)) throw new Error("smoke: retention cron " + RETENTION_CRON + " is not registered (got " + JSON.stringify(registered) + ")");
-  return { d1: db.uuid, kept_bindings: existing.map((b) => b.type + ":" + b.name), etag: up && up.etag, modified_on: up && up.modified_on, crons: registered, secret_names: secretsAfter };
+  return { observability: { enabled: obsGot.enabled, head_sampling_rate: obsGot.head_sampling_rate, redact_query_string: obsGot.redact_query_string, invocation_logs: obsGot.logs.invocation_logs, traces: obsGot.traces ? obsGot.traces.enabled : false }, d1: db.uuid, kept_bindings: existing.map((b) => b.type + ":" + b.name), etag: up && up.etag, modified_on: up && up.modified_on, crons: registered, secret_names: secretsAfter };
 }
 `);

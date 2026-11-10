@@ -127,3 +127,9 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - Checkout DDL runs once per isolate (a module-level promise, retried after a failure).
 - **Accepted LOW:** the public `/api/rro/telemetry` keeps `mode` (`test`/`live`/`unavailable`) and `price_gbp`. They are the documented public contract the smoke test reads, and the price is already shown on the page.
 
+
+### Deploy script safety (P61, P63, P64)
+
+- **P64:** `deploy/build_cf_execute.mjs` reads the rollback target (the version serving 100%) before writing anything. If it can't read it, or no single version is at 100%, it refuses and writes nothing. There is no "roll back by hand" fallback.
+- **P61:** after upload, the script sets the Worker's Workers Logs config through `script-settings`: `observability.enabled=true`, `head_sampling_rate=1`, `redact_query_string=true`, `logs.invocation_logs=false` (no visitor IP, user-agent or geo in stored logs), and `traces.enabled=false`. It then reads the config back. A mismatch, or a failed write or read, stops the deploy before the cron step and rolls back to the previous version. Script-level settings aren't versioned, so re-check them by hand after that rollback. To turn logs off entirely, PATCH `script-settings` with `{"observability":{"enabled":false}}`.
+- **P63:** `webhook_record_failed`, `pack_record_failed` and `webhook_paid_row_missing` alerts are never throttled. Every one is logged.
