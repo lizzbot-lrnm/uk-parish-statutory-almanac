@@ -361,6 +361,17 @@ function rroCleanInputs(raw) {
   };
 }
 
+// P31: one CSV cell encoder for every CSV export (worker.js: calculator Scott Schedule, search/precedent CSV, and the
+// paid pack CSV, which is built from those two). Cells starting with = + - @ TAB or CR get a leading ' so a
+// spreadsheet treats them as text, not a formula. Plain numbers (e.g. "-12.5" or -12.5) are data, not formulas,
+// so they are left as they are and stay numeric in a spreadsheet.
+function rroCsvCell(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "";
+  let s = String(v ?? "");
+  if (!/^-?\d+(\.\d+)?$/.test(s) && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
 function rroOriginAllowed(request) {
   const origin = request.headers.get("Origin");
   if (!origin) return false;
@@ -469,6 +480,7 @@ export {
   rroHmacSha256Hex,
   rroVerifyStripeSignature,
   rroCleanInputs,
+  rroCsvCell,
   rroOriginAllowed,
   rroCheckoutIdempotencyKey,
   rroBrowserNonce,

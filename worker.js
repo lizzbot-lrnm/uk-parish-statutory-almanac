@@ -13,7 +13,7 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
-import { rroEnsureCheckoutSchema, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
+import { rroCsvCell, rroEnsureCheckoutSchema, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
 import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
 
 // Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
@@ -1470,14 +1470,30 @@ const MITIGATION_PCT_ADJUSTMENTS = {
   deposit_unprotected: 5.0,
 };
 
+// P31: calculator inputs get the same allowlist / clamping as the pack path (src/rro_core.js rroCleanInputs).
+const RRO_CALC_REGIONS = ["London", "Southern", "Midlands", "Northern", "Eastern"];
+function rroCalcRegion(v) {
+  const raw = String(v ?? "London").trim().toLowerCase();
+  return RRO_CALC_REGIONS.find((r) => r.toLowerCase() === raw) || "all"; // unknown -> all regions, never echoed
+}
+function rroCalcOffence(v) {
+  const low = String(v ?? "").trim().toLowerCase();
+  if (low === "all") return "all";
+  if (low.includes("95") || low.includes("selective")) return "Selective Licensing (s.95)";
+  if (low.includes("evict") || low.includes("harass")) return "Unlawful Eviction / Harassment";
+  if (low.includes("improvement") || low.includes("civil penalty")) return "Improvement Notice / Civil Penalty";
+  return "Unlicensed HMO (s.72)";
+}
+const rroCalcMoney = (v, d) => Math.min(100000, Math.max(0, parseFloat(v ?? d) || 0));
+
 function calculateRroAwardEdge(params = {}) {
-  const rentMo = Math.max(0, parseFloat(params.monthly_rent_gbp ?? params.rent ?? "1500") || 1500.0);
+  const rentMo = Math.min(100000, Math.max(0, parseFloat(params.monthly_rent_gbp ?? params.rent ?? "1500") || 1500.0));
   const rawMonths = parseInt(params.months_unlicensed ?? params.months_claimed ?? params.months ?? "12", 10);
   const months = Math.max(1, Math.min(24, Number.isNaN(rawMonths) ? 12 : rawMonths));
-  const ucMo = Math.max(0, parseFloat(params.universal_credit_housing_gbp ?? params.universal_credit_monthly_gbp ?? params.uc ?? "0") || 0.0);
-  const utilMo = Math.max(0, parseFloat(params.utilities_included_monthly_gbp ?? params.utilities_monthly_gbp ?? params.utilities ?? "150") || 0.0);
-  const region = String(params.region || "London").trim();
-  const offenceType = String(params.offence_type || "Unlicensed HMO (s.72)").trim();
+  const ucMo = rroCalcMoney(params.universal_credit_housing_gbp ?? params.universal_credit_monthly_gbp ?? params.uc, "0");
+  const utilMo = rroCalcMoney(params.utilities_included_monthly_gbp ?? params.utilities_monthly_gbp ?? params.utilities, "150");
+  const region = rroCalcRegion(params.region);
+  const offenceType = rroCalcOffence(params.offence_type || "Unlicensed HMO (s.72)");
   const partyRole = String(params.party_role || params.role || "landlord_defence").toLowerCase().includes("tenant") ? "tenant_claim" : "landlord_defence";
 
   let mitList = [];
@@ -1486,6 +1502,8 @@ function calculateRroAwardEdge(params = {}) {
   } else if (typeof params.mitigation_factors === "string" && params.mitigation_factors.trim()) {
     mitList = params.mitigation_factors.split(/[,;]/).map((m) => m.trim()).filter((m) => m && m.toLowerCase() !== "all");
   }
+  // Same rule as rroCleanInputs: lower-case factor codes only, max 8 (anything else, e.g. =HYPERLINK(...), is dropped).
+  mitList = mitList.map((m) => m.toLowerCase()).filter((m) => /^[a-z0-9_]{2,40}$/.test(m)).slice(0, 8);
   if (utilMo > 0 && !mitList.includes("utilities_deducted")) mitList.push("utilities_deducted");
   if (ucMo > 0 && !mitList.includes("universal_credit_deducted")) mitList.push("universal_credit_deducted");
 
@@ -1614,11 +1632,7 @@ function calculateRroAwardEdge(params = {}) {
   for (const p of topPrecedents) {
     csvRows.push(["COMPARABLE_PRECEDENT", p.case_ref, p.region, p.decision_date, p.offence_type, p.claimed_gbp ?? "", p.awarded_gbp ?? "", p.award_pct_of_rent ?? "", p.award_source || "direct", (p.mitigation_factors || []).join(";"), p.pdf_url, p.judge_summary]);
   }
-  const escCsv = (v) => {
-    const s = String(v ?? "");
-    return s.includes(",") || s.includes('"') || s.includes("\n") ? '"' + s.replace(/"/g, '""') + '"' : s;
-  };
-  const scheduleCsv = csvRows.map((row) => row.map(escCsv).join(",")).join("\r\n") + "\r\n";
+  const scheduleCsv = csvRows.map((row) => row.map(rroCsvCell).join(",")).join("\r\n") + "\r\n";
 
   return {
     status: "ok",
@@ -1944,14 +1958,8 @@ function exportRroPrecedentsCsv(records) {
     "claimed_gbp", "awarded_gbp", "award_pct_of_rent", "award_source",
     "respondent_type", "mitigation_factors", "title", "pdf_url", "judge_summary"
   ];
-  const esc = (val) => {
-    const s = String(val ?? "");
-    if (s.includes(",") || s.includes('"') || s.includes("\n")) {
-      return '"' + s.replace(/"/g, '""') + '"';
-    }
-    return s;
-  };
-  const lines = [headers.join(",")];
+  const esc = rroCsvCell;
+  const lines = [headers.map(rroCsvCell).join(",")];
   for (const r of records) {
     lines.push([
       esc(r.case_ref),
@@ -2360,6 +2368,34 @@ This site is not a law firm and the figures here are not a prediction of what a 
       return "£" + Number(v).toLocaleString("en-GB", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
     }
 
+    function rroEsc(v) {
+      return String(v === null || v === undefined ? "" : v)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+    function rroSafePdfUrl(u) {
+      try {
+        const p = new URL(String(u || ""));
+        if (p.protocol === "https:" && p.hostname === "assets.publishing.service.gov.uk" && !p.port && !p.username && !p.password) return p.href;
+      } catch (e) {}
+      return "";
+    }
+    function rroResultRowHtml(r) {
+      const tags = (Array.isArray(r.mitigation_factors) ? r.mitigation_factors : []).map((m) => '<span class="tag">' + rroEsc(m) + "</span>").join("");
+      const hasPct = r.award_pct_of_rent !== null && r.award_pct_of_rent !== undefined && r.award_pct_of_rent !== "";
+      const pct = hasPct ? '<span class="pct-pill">' + rroEsc(r.award_pct_of_rent) + "%</span>" : "—";
+      const pdf = rroSafePdfUrl(r.pdf_url);
+      const pdfCell = pdf ? '<a href="' + rroEsc(pdf) + '" target="_blank" rel="noopener noreferrer">GOV.UK PDF ↗</a>' : "—";
+      return "<tr>" +
+        "<td><strong>" + rroEsc(r.case_ref) + '</strong><br/><span style="color:#64748b;font-size:0.78rem;">' + rroEsc(r.decision_date) + "</span></td>" +
+        "<td><strong>" + rroEsc(r.region) + '</strong><br/><span style="color:#334155;font-size:0.8rem;">' + rroEsc(r.title) + "</span></td>" +
+        "<td>" + rroEsc(r.offence_type) + "</td>" +
+        "<td>Claimed: <strong>" + rroEsc(fmtGbp(r.claimed_gbp)) + "</strong><br/>Awarded: <strong>" + rroEsc(fmtGbp(r.awarded_gbp)) + "</strong> (" + pct + ')<br/><span style="font-size:0.72rem;color:#475569;">Source: <code>' + rroEsc(r.award_source || "direct") + "</code> · " + rroEsc(r.respondent_type || "individual") + "</span></td>" +
+        "<td><div>" + tags + '</div><div style="margin-top:0.35rem;color:#334155;font-size:0.8rem;">' + rroEsc(r.judge_summary) + "</div></td>" +
+        "<td>" + pdfCell + "</td>" +
+      "</tr>";
+    }
+
     async function runRroSearch() {
       const q = document.getElementById("q").value;
       const region = document.getElementById("region").value;
@@ -2390,18 +2426,9 @@ This site is not a law firm and the figures here are not a prediction of what a 
         tbody.innerHTML = '<tr><td colspan="6">No matching rulings found. Try broadening your filter.</td></tr>';
         return;
       }
-      tbody.innerHTML = data.results.map((r) => {
-        const tags = (r.mitigation_factors || []).map((m) => "<span class="tag">" + m + "</span>").join("");
-        const pct = r.award_pct_of_rent !== null && r.award_pct_of_rent !== undefined ? "<span class="pct-pill">" + r.award_pct_of_rent + "%</span>" : "—";
-        return "<tr>" +
-          "<td><strong>" + r.case_ref + "</strong><br/><span style="color:#64748b;font-size:0.78rem;">" + r.decision_date + "</span></td>" +
-          "<td><strong>" + r.region + "</strong><br/><span style="color:#334155;font-size:0.8rem;">" + r.title + "</span></td>" +
-          "<td>" + r.offence_type + "</td>" +
-          "<td>Claimed: <strong>" + fmtGbp(r.claimed_gbp) + "</strong><br/>Awarded: <strong>" + fmtGbp(r.awarded_gbp) + "</strong> (" + pct + ")<br/><span style=\"font-size:0.72rem;color:#475569;\">Source: <code>" + (r.award_source || "direct") + "</code> · " + (r.respondent_type || "individual") + "</span></td>" +
-          "<td><div>" + tags + "</div><div style="margin-top:0.35rem;color:#334155;font-size:0.8rem;">" + r.judge_summary + "</div></td>" +
-          "<td><a href="" + r.pdf_url + "" target="_blank" rel="noopener">GOV.UK PDF ↗</a></td>" +
-        "</tr>";
-      }).join("");
+      // P30: every dataset field is HTML-escaped before it reaches innerHTML, and a PDF link is rendered
+      // only for https://assets.publishing.service.gov.uk/ (anything else, e.g. javascript:, shows a dash).
+      tbody.innerHTML = data.results.map(rroResultRowHtml).join("");
     }
 
     async function runPrivateAudit() {
@@ -2436,7 +2463,7 @@ This site is not a law firm and the figures here are not a prediction of what a 
       document.getElementById("calcCsvLink").href = "/api/rro-calculate?" + qs.toString() + "&format=csv";
       const resp = await fetch("/api/rro-calculate?" + qs.toString());
       const data = await resp.json();
-      document.getElementById("calcOutput").textContent = JSON.stringify(data.calculation, null, 2) + "\n\n" + data.schedule_markdown;
+      document.getElementById("calcOutput").textContent = JSON.stringify(data.calculation, null, 2) + "\\n\\n" + data.schedule_markdown;
     }
     async function startFormalPackCheckout() {
       const btn = document.getElementById("formalPackBtn");
