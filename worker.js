@@ -13,7 +13,7 @@
  * 8. Apify .actor/input_schema.json -> MCP (tools/list) Silent Bug Linter & Auto-Fixer (required + default trap detector)
  */
 
-import { rroCsvCell, rroEnsureCheckoutSchema, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
+import { rroCsvCell, rroEnsureCheckoutSchema, rroHtmlCsp, rroPurgeIpHashes, rroReadCappedBody } from "./src/rro_core.js";
 import { rroTelemetryAuthorised } from "./src/rro_checkout.js";
 
 // Unauthenticated POST bodies (audit-pdf, apify-mcp-lint, pdf-clause-extract, /mcp) are capped at 64 KB
@@ -30,7 +30,7 @@ function payloadTooLarge(corsHeaders, maxBytes = PUBLIC_POST_BODY_MAX_BYTES) {
     { status: 413, headers: { ...(corsHeaders || {}), "Cache-Control": "no-store" } }
   );
 }
-import { rroHandleCheckoutRoutes, rroRenderRroPage, setRroDeps } from "./src/rro_pages.js";
+import { rroHandleCheckoutRoutes, rroPublicApiRateLimitResponse, rroRenderRroPage, rroUnhandledErrorResponse, setRroDeps } from "./src/rro_pages.js";
 
 const GOV_UK_BANK_HOLIDAYS_URL = "https://www.gov.uk/bank-holidays.json";
 const POSTCODES_IO_URL = "https://api.postcodes.io/postcodes";
@@ -1473,7 +1473,7 @@ const MITIGATION_PCT_ADJUSTMENTS = {
 // P31: calculator inputs get the same allowlist / clamping as the pack path (src/rro_core.js rroCleanInputs).
 const RRO_CALC_REGIONS = ["London", "Southern", "Midlands", "Northern", "Eastern"];
 function rroCalcRegion(v) {
-  const raw = String(v ?? "London").trim().toLowerCase();
+  const raw = String(v ?? "").trim().toLowerCase() || "london"; // P39: missing or blank -> London (same as the pack path)
   return RRO_CALC_REGIONS.find((r) => r.toLowerCase() === raw) || "all"; // unknown -> all regions, never echoed
 }
 function rroCalcOffence(v) {
@@ -2396,6 +2396,43 @@ This site is not a law firm and the figures here are not a prediction of what a 
       "</tr>";
     }
 
+    // P39: every fetch goes through rroFetchJson, which never throws: a network failure, an HTML 5xx page or
+    // a 429 becomes { ok: false, message } and the caller shows a friendly error state instead of an
+    // unhandled promise rejection.
+    async function rroFetchJson(url, opts) {
+      let resp;
+      try {
+        resp = await fetch(url, opts);
+      } catch (e) {
+        return { ok: false, message: "We could not reach the server. Check your connection and try again." };
+      }
+      let data = null;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        data = null;
+      }
+      if (resp.status === 429) return { ok: false, message: "Too many requests from your connection. Please wait a few minutes and try again." };
+      if (!resp.ok || !data || typeof data !== "object") return { ok: false, message: "This service is temporarily unavailable. Please try again shortly." };
+      return { ok: true, data };
+    }
+    function rroShowSearchError(message) {
+      for (const id of ["statCount", "statMedian", "statMean", "statClaimed", "statAwarded"]) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = "—";
+      }
+      const tbody = document.getElementById("resultsBody");
+      tbody.textContent = "";
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 6;
+      td.className = "rro-error";
+      td.setAttribute("role", "alert");
+      td.textContent = message;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+
     async function runRroSearch() {
       const q = document.getElementById("q").value;
       const region = document.getElementById("region").value;
@@ -2413,8 +2450,12 @@ This site is not a law firm and the figures here are not a prediction of what a 
       document.getElementById("jsonApiLink").href = apiUrl;
       document.getElementById("csvDownloadLink").href = "/api/rro-search?" + csvParams.toString();
 
-      const resp = await fetch(apiUrl);
-      const data = await resp.json();
+      const got = await rroFetchJson(apiUrl);
+      if (!got.ok || !got.data.stats) {
+        rroShowSearchError(got.ok ? "This service is temporarily unavailable. Please try again shortly." : got.message);
+        return;
+      }
+      const data = got.data;
       document.getElementById("statCount").textContent = data.stats.total_matched;
       document.getElementById("statMedian").textContent = data.stats.median_award_pct + "%";
       document.getElementById("statMean").textContent = data.stats.mean_award_pct + "%";
@@ -2433,13 +2474,12 @@ This site is not a law firm and the figures here are not a prediction of what a 
 
     async function runPrivateAudit() {
       const claim_text = document.getElementById("privateText").value;
-      const resp = await fetch("/api/rro-audit-pdf", {
+      const got = await rroFetchJson("/api/rro-audit-pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ claim_text })
       });
-      const data = await resp.json();
-      document.getElementById("auditOutput").textContent = JSON.stringify(data, null, 2);
+      document.getElementById("auditOutput").textContent = got.ok ? JSON.stringify(got.data, null, 2) : got.message;
     }
 
     document.getElementById("searchBtn").addEventListener("click", runRroSearch);
@@ -2461,8 +2501,12 @@ This site is not a law firm and the figures here are not a prediction of what a 
       const qs = new URLSearchParams({ monthly_rent_gbp, months_unlicensed, universal_credit_housing_gbp, utilities_included_monthly_gbp, region, party_role, mitigation_factors: mitigation });
       document.getElementById("calcMdLink").href = "/api/rro-calculate?" + qs.toString() + "&format=markdown";
       document.getElementById("calcCsvLink").href = "/api/rro-calculate?" + qs.toString() + "&format=csv";
-      const resp = await fetch("/api/rro-calculate?" + qs.toString());
-      const data = await resp.json();
+      const got = await rroFetchJson("/api/rro-calculate?" + qs.toString());
+      if (!got.ok || !got.data.calculation) {
+        document.getElementById("calcOutput").textContent = got.ok ? "This service is temporarily unavailable. Please try again shortly." : got.message;
+        return;
+      }
+      const data = got.data;
       document.getElementById("calcOutput").textContent = JSON.stringify(data.calculation, null, 2) + "\\n\\n" + data.schedule_markdown;
     }
     async function startFormalPackCheckout() {
@@ -2710,9 +2754,9 @@ async function handleMcpRpcMessage(msg, isInternal) {
 // /rro/stats is token-gated, so it is not advertised in the public sitemap.
 const RRO_PUBLIC_SITEMAP_XML = RRO_SITEMAP_XML.replace(/\s*<url>\s*<loc>https:\/\/parish\.technoplusit\.co\.uk\/rro\/stats<\/loc>[\s\S]*?<\/url>/, "");
 
-export default {
-  async fetch(request, env = {}, ctx) {
+async function handleFetch(request, env = {}, ctx) {
     const url = new URL(request.url);
+
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -2723,11 +2767,14 @@ export default {
       "Referrer-Policy": "strict-origin-when-cross-origin",
       "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
     };
-    const htmlHeaders = {
+    // P39 / P24: HTML pages carry a hash-based CSP (no 'unsafe-inline' scripts), frame-ancestors 'none'
+    // plus X-Frame-Options DENY and nosniff (from corsHeaders). The script hashes come from the trusted page
+    // template constant passed in here, never from the response body.
+    const htmlHeadersFor = async (trustedTemplate) => ({
       ...corsHeaders,
-      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com",
+      "Content-Security-Policy": await rroHtmlCsp(trustedTemplate),
       "Content-Type": "text/html; charset=utf-8",
-    };
+    });
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
@@ -2806,7 +2853,7 @@ export default {
 
     if (url.pathname === "/rro" || url.pathname === "/rro/") {
       const rroPage = await rroRenderRroPage(request, env || {}, url);
-      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...htmlHeaders, ...rroPage.headers });
+      const rroHeaders = new Headers(rroPage.redirect ? rroPage.headers : { ...(await htmlHeadersFor(RRO_HTML_PAGE)), ...rroPage.headers });
       for (const c of rroPage.cookies || []) rroHeaders.append("Set-Cookie", c);
       if (rroPage.redirect) return new Response(null, { status: 302, headers: rroHeaders });
       return new Response(rroPage.html, { headers: rroHeaders });
@@ -2845,7 +2892,7 @@ export default {
             return Response.json(rendered, { headers: corsHeaders });
           }
           return new Response(rendered, {
-            headers: htmlHeaders,
+            headers: await htmlHeadersFor(""), // SEO pages have no executable inline script (JSON-LD only)
           });
         }
         return Response.json(
@@ -2854,6 +2901,10 @@ export default {
         );
       }
     }
+
+    // P15: per-IP limit on search + calculate, every alias, checked before any body is read (src/rro_pages.js).
+    const rroLimited = await rroPublicApiRateLimitResponse(request, env || {}, url);
+    if (rroLimited) return rroLimited;
 
     if (
       url.pathname === "/api/rro-search" ||
@@ -3233,7 +3284,7 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(HTML_PAGE, {
-        headers: htmlHeaders,
+        headers: await htmlHeadersFor(HTML_PAGE),
       });
     }
 
@@ -3241,6 +3292,16 @@ export default {
       { status: "error", error: "NOT_FOUND", path: url.pathname },
       { status: 404, headers: corsHeaders }
     );
+}
+
+export default {
+  // P16: an unexpected exception becomes a generic 500; the detail goes to the log only (src/rro_pages.js).
+  async fetch(request, env = {}, ctx) {
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (err) {
+      return rroUnhandledErrorResponse(err, request);
+    }
   },
 
   // T3: MANDATORY hourly cron ("0 * * * *", registered and verified by deploy/build_cf_execute.mjs) runs the full
