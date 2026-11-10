@@ -6,6 +6,10 @@ import {
   RRO_PACK_CURRENCY,
   RRO_PUBLIC_ORIGIN,
   RRO_CHECKOUT_RATE_LIMIT,
+  RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
+  RRO_CHECKOUT_DAILY_ALERT_FRACTION,
+  rroCheckoutDailyCap,
+  rroD1CounterHitCount,
   RRO_PAID_CACHE_TTL_MS,
   RRO_TEST_MODE_LABEL,
   RRO_DAY7_RULE,
@@ -71,6 +75,23 @@ async function rroHandleCheckoutCreate(request, env) {
   const allowed = await rroRateLimitHit(db, "checkout", ipHash, RRO_CHECKOUT_RATE_LIMIT.max_starts, RRO_CHECKOUT_RATE_LIMIT.window_minutes);
   if (!allowed) {
     return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(RRO_CHECKOUT_RATE_LIMIT.window_minutes * 60) });
+  }
+  // P53: global daily ceiling on new Stripe sessions. Fail closed: over the cap or on any counter error,
+  // a generic 503 and no Stripe call. Counted after the per-IP limit, so one IP cannot burn the day's budget.
+  const dailyCap = rroCheckoutDailyCap(env);
+  let dailyN = 0;
+  try {
+    dailyN = await rroD1CounterHitCount(db, "checkout_daily", "global", dailyCap, RRO_CHECKOUT_DAILY_WINDOW_MINUTES);
+  } catch (err) {
+    rroAlert("checkout_daily_counter_failed", { mode: mode.mode, error: String((err && err.message) || err).slice(0, 200) });
+    return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
+  }
+  if (!dailyN) {
+    rroAlert("checkout_daily_cap_hit", { mode: mode.mode, cap: dailyCap });
+    return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
+  }
+  if (dailyN >= Math.ceil(dailyCap * RRO_CHECKOUT_DAILY_ALERT_FRACTION)) {
+    rroAlert("checkout_daily_volume_high", { mode: mode.mode, n: dailyN, cap: dailyCap });
   }
   await rroPurgeIpHashes(db);
 

@@ -27,6 +27,23 @@ const RRO_PACK_PRICE_PENCE = 2400;
 const RRO_PACK_CURRENCY = "gbp";
 const RRO_PUBLIC_ORIGIN = "https://parish.technoplusit.co.uk";
 const RRO_CHECKOUT_RATE_LIMIT = { max_starts: 5, window_minutes: 10 };
+// P53: global ceiling on NEW Stripe Checkout sessions per UTC day (all IPs together), D1-counted in
+// rro_rate_counters (bucket checkout_daily, key global, window = the UTC day). Conservative launch default;
+// raise it by setting the plain var RRO_CHECKOUT_DAILY_CAP (an integer 1..10000; anything else falls back to
+// this default, never to "unlimited"). Over the cap, or on a counter error, checkout fails closed (503) and
+// Stripe is not called. Pack/success lookups (paid buyers) never touch this counter.
+const RRO_CHECKOUT_DAILY_CAP_DEFAULT = 50;
+const RRO_CHECKOUT_DAILY_CAP_MAX = 10000;
+const RRO_CHECKOUT_DAILY_WINDOW_MINUTES = 24 * 60;
+// Volume alert (throttled by rroAlert) once the day's count reaches this fraction of the cap.
+const RRO_CHECKOUT_DAILY_ALERT_FRACTION = 0.5;
+function rroCheckoutDailyCap(env) {
+  const raw = env && env.RRO_CHECKOUT_DAILY_CAP;
+  const s = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
+  if (!/^[0-9]{1,5}$/.test(s)) return RRO_CHECKOUT_DAILY_CAP_DEFAULT;
+  const n = Number(s);
+  return n >= 1 && n <= RRO_CHECKOUT_DAILY_CAP_MAX ? n : RRO_CHECKOUT_DAILY_CAP_DEFAULT;
+}
 const RRO_LOOKUP_RATE_LIMIT = { max_hits: 30, window_minutes: 10 };
 const RRO_PAID_CACHE_TTL_MS = 10 * 60 * 1000;
 // P2: a "not paid" (or Stripe-404) verdict for a known session is cached for 30 s, so a polling or
@@ -209,6 +226,18 @@ async function rroD1CounterHit(db, bucket, keyHash, max, windowMinutes, nowMs) {
     .bind(bucket, keyHash, rroWindowStartIso(windowMinutes, now), max)
     .first();
   return Boolean(row);
+}
+// Same conditional upsert as rroD1CounterHit, but returns the admitted count (1..max), or 0 when over the limit.
+async function rroD1CounterHitCount(db, bucket, keyHash, max, windowMinutes, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const row = await db
+    .prepare(
+      "INSERT INTO rro_rate_counters (bucket, key_hash, window_start_utc, n) VALUES (?1, ?2, ?3, 1) " +
+        "ON CONFLICT(bucket, key_hash, window_start_utc) DO UPDATE SET n = n + 1 WHERE n < ?4 RETURNING n"
+    )
+    .bind(bucket, keyHash, rroWindowStartIso(windowMinutes, now), max)
+    .first();
+  return row ? Number(row.n) || 0 : 0;
 }
 // Batched global counter: adds `delta` in one upsert and returns the new window total.
 async function rroD1CounterAdd(db, bucket, keyHash, delta, windowMinutes, nowMs) {
@@ -476,7 +505,9 @@ async function rroPurgeIpHashes(db, nowMs) {
   await db.prepare("UPDATE rro_checkout_events SET ip_hash = NULL WHERE ip_hash IS NOT NULL AND created_at_utc < ?1").bind(eventCutoff).run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE created_at_utc < ?1").bind(hitCutoff).run();
   // P15: aggregate counter rows are only needed for their 10-minute window.
-  await db.prepare("DELETE FROM rro_rate_counters WHERE window_start_utc < ?1").bind(hitCutoff).run();
+  // P53: the daily checkout counter must survive the hourly purge for its whole UTC day (kept 48 h).
+  const dayCutoff = new Date(now - 48 * 3600000).toISOString();
+  await db.prepare("DELETE FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket != 'checkout_daily' OR window_start_utc < ?2)").bind(hitCutoff, dayCutoff).run();
 }
 
 // Opportunistic retention on the webhook write path: at most `limit` rows per table per call.
@@ -491,8 +522,8 @@ async function rroPurgeIpHashesBounded(db, limit, nowMs) {
     .run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE id IN (SELECT id FROM rro_rate_hits WHERE created_at_utc < ?1 LIMIT ?2)").bind(hitCutoff, n).run();
   await db
-    .prepare("DELETE FROM rro_rate_counters WHERE rowid IN (SELECT rowid FROM rro_rate_counters WHERE window_start_utc < ?1 LIMIT ?2)")
-    .bind(hitCutoff, n)
+    .prepare("DELETE FROM rro_rate_counters WHERE rowid IN (SELECT rowid FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket != 'checkout_daily' OR window_start_utc < ?3) LIMIT ?2)")
+    .bind(hitCutoff, n, new Date(now - 48 * 3600000).toISOString())
     .run();
 }
 
@@ -712,6 +743,12 @@ export {
   RRO_PACK_CURRENCY,
   RRO_PUBLIC_ORIGIN,
   RRO_CHECKOUT_RATE_LIMIT,
+  RRO_CHECKOUT_DAILY_CAP_DEFAULT,
+  RRO_CHECKOUT_DAILY_CAP_MAX,
+  RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
+  RRO_CHECKOUT_DAILY_ALERT_FRACTION,
+  rroCheckoutDailyCap,
+  rroD1CounterHitCount,
   RRO_LOOKUP_RATE_LIMIT,
   RRO_PAID_CACHE_TTL_MS,
   RRO_NOT_PAID_CACHE_TTL_MS,
