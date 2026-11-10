@@ -965,7 +965,7 @@ const LLMS_TXT = `# UK Parish Council, Village Hall, Charity & Payroll Statutory
 
 ## Live Endpoints
 - POST /mcp (Streamable HTTP MCP JSON-RPC 2.0 Server: initialize, tools/list, tools/call; GET /mcp for manifest)
-- GET /rro (Interactive UK Property Tribunal Rent Repayment Order & Section 13 Precedent Finder UI)
+- GET /rro (Rent Repayment Order (RRO) tribunal precedent finder UI, for tenants and local housing authorities)
 - GET /api/rro/search?borough=Camden&region=London (also aliased at /api/rro-search)
 - GET /api/rro-search?format=csv (Download Regional RRO Precedent Pack CSV)
 - POST /api/rro-audit-pdf (Private RRO claim check: compares your draft claim with published tribunal decisions; your text is not stored)
@@ -1062,7 +1062,8 @@ const HTML_PAGE = `<!DOCTYPE html>
   </header>
   <main class="container">
     <div class="callout" style="background:#eff6ff;border-left:4px solid #1d4ed8;">
-      <strong>NEW NORTH STAR LIVE — <a href="/rro" style="color:#1d4ed8;font-weight:700;">UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder (/rro) &rarr;</a></strong><br/>
+      <strong>NEW NORTH STAR LIVE — <a href="/rro" style="color:#1d4ed8;font-weight:700;">Rent Repayment Order (RRO) tribunal precedent finder (/rro) &rarr;</a></strong><br/>
+      For tenants, tenant advisers and local housing authority enforcement teams (Housing and Planning Act 2016 s.41 &mdash; not parish or town councils).<br/>
       Search <strong>281 real GOV.UK First-tier Tribunal (Property Chamber) RRO PDF decisions</strong> (including <code>LON/00AJ/HMG/2025/0666</code>, Ealing £21,000 claimed &rarr; £8,400 awarded, 40%), filter by region, offence (s.72 HMO / s.95 Selective Licensing), and s.44 mitigation factors, run a <strong>private claim check</strong> (your text is not stored), or <a href="/api/rro-search?format=csv" style="color:#1d4ed8;font-weight:600;">download the Regional RRO Precedent Pack (CSV)</a>.
     </div>
     <div class="callout">
@@ -1228,7 +1229,7 @@ Clause 9.1 (Matter of Concern &amp; Reserves Policy): In connection with my inde
     </div>
 
     <footer>
-      Powered by official UK Open Government Licence v3.0 data (<a href="https://www.gov.uk/bank-holidays.json">GOV.UK Bank Holidays</a>, <a href="https://api.postcodes.io">ONS / OS Postcodes.io</a>, and Cloudflare DNS-over-HTTPS). Machine-readable discovery: <a href="/llms.txt">/llms.txt</a> · <a href="/.well-known/agent.json">/.well-known/agent.json</a> · <a href="/api/health">/api/health</a>.
+      Powered by official UK Open Government Licence v3.0 data (<a href="https://www.gov.uk/bank-holidays.json">GOV.UK Bank Holidays</a>, <a href="https://api.postcodes.io">ONS / OS Postcodes.io</a>, and Cloudflare DNS-over-HTTPS). Rent Repayment Order precedents: <a href="/rro">/rro</a>. Machine-readable discovery: <a href="/llms.txt">/llms.txt</a> · <a href="/.well-known/agent.json">/.well-known/agent.json</a> · <a href="/api/health">/api/health</a>.
     </footer>
   </main>
   <script>
@@ -1323,7 +1324,7 @@ Clause 9.1 (Matter of Concern &amp; Reserves Policy): In connection with my inde
 
 
 // ============================================================================
-// UK Property Tribunal Rent Repayment Order (RRO) & Section 13 Precedent Finder
+// Rent Repayment Order (RRO) tribunal precedent finder
 // 281 Real GOV.UK Residential Property Tribunal Decisions (OGL v3.0 Read-Only)
 // Enriched with Vizzy's 199-decision provenance (award_source: direct / inferred / none)
 // ============================================================================
@@ -2116,8 +2117,18 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</title>
-  <meta name="description" content="Search 281 real GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order (RRO) decisions under Housing Act 2004 s.72/s.95 &amp; Housing and Planning Act 2016 s.40-44. Filter by region, offence, and mitigation factors, or check a draft claim privately (your text is not stored)." />
+  <title>Rent Repayment Order (RRO) tribunal precedents</title>
+  <meta name="description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <link rel="canonical" href="https://parish.technoplusit.co.uk/rro" />
+  <meta property="og:type" content="website" />
+  <meta property="og:locale" content="en_GB" />
+  <meta property="og:url" content="https://parish.technoplusit.co.uk/rro" />
+  <meta property="og:title" content="Rent Repayment Order (RRO) tribunal precedents" />
+  <meta property="og:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="Rent Repayment Order (RRO) tribunal precedents" />
+  <meta name="twitter:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <!--RRO_JSONLD-->
   <style>
     :root { --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #475569; --accent: #0f766e; --border: #e2e8f0; --ok: #15803d; --blue: #1d4ed8; }
     * { box-sizing: border-box; }
@@ -2149,6 +2160,10 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
     .tag { display: inline-block; background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; border-radius: 4px; padding: 0.1rem 0.4rem; font-size: 0.72rem; margin: 0.1rem 0.15rem 0.1rem 0; }
     .pct-pill { font-weight: 700; color: #0f766e; background: #ccfbf1; padding: 0.15rem 0.45rem; border-radius: 4px; }
     pre { background: #0f172a; color: #e2e8f0; padding: 0.9rem; border-radius: 8px; overflow-x: auto; font-size: 0.78rem; max-height: 360px; }
+    .audience { background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--blue); border-radius: 8px; padding: 0.85rem 1rem; font-size: 0.92rem; margin: 0 0 1.25rem 0; }
+    .faq dt { font-weight: 700; margin-top: 0.85rem; }
+    .faq dd { margin: 0.25rem 0 0 0; color: var(--muted); font-size: 0.9rem; }
+    .site-footer { color: var(--muted); font-size: 0.82rem; padding-bottom: 2rem; }
   </style>
 </head>
 <body>
@@ -2158,17 +2173,17 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <span><strong>TechnoPlusIT UK Statutory Precedent Engine</strong> · Source data: GOV.UK, Open Government Licence v3.0</span>
         <div>
           <a href="/">← Back to UK Statutory Almanac</a> &nbsp;|&nbsp;
-          <a href="/api/rro-search?format=csv">Download Regional Precedent Pack (CSV)</a> &nbsp;|&nbsp;
-          <a href="/api/rro-search">JSON API</a>
+          <a href="/api/rro-search?format=csv">Download published decisions (CSV)</a> &nbsp;|&nbsp;
+          <a href="/api/rro-search">JSON API</a> &nbsp;|&nbsp;
+          <a href="https://www.gov.uk/government/publications/apply-for-a-rent-repayment-order-form-rro1">Form RRO1</a>
         </div>
       </div>
-      <h1>UK Property Tribunal Rent Repayment Order (RRO) &amp; Section 13 Precedent Finder</h1>
-      <p class="subtitle">Zero-token deterministic index of 281 real GOV.UK First-tier Tribunal (Property Chamber) RRO decisions under Housing Act 2004 (s.72 HMO / s.95 Selective Licensing) &amp; Housing and Planning Act 2016 (ss.40–44).</p>
+      <h1>Rent Repayment Order (RRO) tribunal precedent finder</h1>
+      <p class="subtitle">A free, searchable index of 281 published GOV.UK First-tier Tribunal (Property Chamber) Rent Repayment Order decisions, mainly about unlicensed HMOs (Housing Act 2004 s.72), selective licensing (s.95), and related offences under the Housing and Planning Act 2016. Built for tenants, tenant advisers, and local housing authority enforcement teams in England. This is not legal advice.</p>
       <div class="badge-row">
-        <span class="badge">281 Real GOV.UK Tribunal PDFs Indexed</span>
-        <span class="badge">Read-Only (?mode=ro) OGL v3.0 Reference Index</span>
+        <span class="badge">281 published GOV.UK tribunal decisions</span>
+        <span class="badge">Open Government Licence v3.0</span>
         <span class="badge">Private claim check (text not stored)</span>
-        <span class="badge">0 LLM Tokens · Deterministic PDF Ligature Recovery</span>
         <span class="badge" id="northStarBadge" style="background:#0d9488;color:#fff;font-weight:700;">Free precedent search</span>
       </div>
     </div>
@@ -2197,6 +2212,11 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
         <div class="stat-val" id="statAwarded">£364,613</div>
       </div>
     </div>
+
+    <p class="audience" id="rroAudience">A tenant, or a local housing authority, can apply to the First-tier Tribunal for a rent repayment order (Housing and Planning Act 2016 s.41). Parish and town councils cannot. Use the search and calculator below to look up published decisions and estimate a range; then file <a href="https://www.gov.uk/government/publications/apply-for-a-rent-repayment-order-form-rro1">Form RRO1</a> if you decide to apply (applications are made to the tribunal on that form, not through this site). Official guidance:
+<a href="https://www.gov.uk/guidance/rent-repayment-orders-guidance-for-tenants">for tenants</a> and
+<a href="https://www.gov.uk/government/publications/rent-repayment-orders-guidance-for-local-authorities/rent-repayment-orders-guidance-for-local-authorities">for local authorities</a>.
+This site is not a law firm and the figures here are not a prediction of what a tribunal will award in a new case. This is not legal advice.</p>
 
     <div class="card">
       <h2>1. Search &amp; Filter Real GOV.UK RRO Tribunal Precedents</h2>
@@ -2327,7 +2347,12 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
       </div>
       <pre id="auditOutput">Click above to benchmark private claim exposure against read-only OGL v3.0 rulings...</pre>
     </div>
+
+    <!--RRO_FAQ_SECTION-->
   </main>
+  <footer class="container site-footer">
+    <p>How this site works: the index is built deterministically from published tribunal PDFs, with no AI model in the loop; text you paste into the private claim check is used only to produce the result and is not stored. Contains public sector information licensed under the <a href="https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/">Open Government Licence v3.0</a>. Machine-readable summary: <a href="/llms.txt">/llms.txt</a>. Official guidance: <a href="https://www.gov.uk/guidance/rent-repayment-orders-guidance-for-tenants">for tenants</a> · <a href="https://www.gov.uk/government/publications/rent-repayment-orders-guidance-for-local-authorities/rent-repayment-orders-guidance-for-local-authorities">for local authorities</a> · <a href="https://www.gov.uk/government/publications/apply-for-a-rent-repayment-order-form-rro1">Form RRO1</a>. Not legal advice. <a href="/">UK Statutory Almanac</a></p>
+  </footer>
 
   <script>
     function fmtGbp(v) {

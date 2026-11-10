@@ -55,14 +55,14 @@ const DISABLED = [
 ];
 
 for (const [label, over] of DISABLED) {
-  test("disabled (" + label + "): /rro shows £24 'checkout coming soon', no CTA, no £29, no Stripe link, no fetch", async () => {
+  test("disabled (" + label + "): /rro shows £24 'cannot be purchased today' note, no CTA, no £29, no Stripe link, no fetch", async () => {
     trapFetch();
     for (const headers of [{}, PREVIEW]) {
       const r = await worker.fetch(get("/rro", headers), noStripeEnv(over));
       assert.equal(r.status, 200);
       assert.equal(r.headers.get("X-RRO-CTA"), "hidden");
       const html = await r.text();
-      assert.match(html, /id="formalPackComingSoon"[^>]*>Formal Tribunal Appeal Pack \(£24\): checkout coming soon\./);
+      assert.match(html, /id="formalPackComingSoon"[^>]*>Optional Export Formal Tribunal Appeal Pack \(£24\):[^<]*Checkout is not enabled on this page yet, so this pack cannot be purchased today\./);
       assert.doesNotMatch(html, /id="formalPackBtn"/);
       assert.doesNotMatch(html, /£29|rro-buy-pack|rro\/buy-pack/);
       // No link or form out to Stripe (the inline script only has an allow-list check for a returned URL).
