@@ -2349,7 +2349,7 @@ This site is not a law firm and the figures here are not a prediction of what a 
         Paste a draft RRO claim, statement of case, or text copied from a PDF below. We compare it with published tribunal decisions and show comparable awards. Your text is used only to produce the result and is not stored.
       </p>
       <label for="privateText">Your draft claim or statement of case (not stored)</label>
-      <textarea id="privateText">Case Reference: Draft Claim (Ealing London W3). Application for a Rent Repayment Order under section 95(1) Housing Act 2004 (Selective Licensing) and section 72(1) HMO. Total rent paid and claimed for 12 months is £21,000.00 inclusive of utilities and council tax. The landlord relied upon a managing agent, had no previous convictions, and applied for a licence once notified.</textarea>
+      <textarea id="privateText" autocomplete="off">Case Reference: Draft Claim (Ealing London W3). Application for a Rent Repayment Order under section 95(1) Housing Act 2004 (Selective Licensing) and section 72(1) HMO. Total rent paid and claimed for 12 months is £21,000.00 inclusive of utilities and council tax. The landlord relied upon a managing agent, had no previous convictions, and applied for a licence once notified.</textarea>
       <div class="btn-row">
         <button id="auditBtn" type="button">Check my claim</button>
       </div>
@@ -2516,9 +2516,9 @@ This site is not a law firm and the figures here are not a prediction of what a 
     document.getElementById("searchBtn").addEventListener("click", async () => {
       await refreshFreeSearchBadge();
     });
+    // P37: the claim check runs only when the user clicks "Check my claim"; nothing is sent on page load.
     (async () => {
       await runRroSearch();
-      await runPrivateAudit();
       await refreshFreeSearchBadge();
     })();
   </script>
