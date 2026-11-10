@@ -2197,19 +2197,19 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
       </div>
       <div class="stat-box">
         <div class="stat-label">Median Tribunal Award %</div>
-        <div class="stat-val" id="statMedian">60.0%</div>
+        <div class="stat-val" id="statMedian">60%</div>
       </div>
       <div class="stat-box">
         <div class="stat-label">Mean Tribunal Award %</div>
-        <div class="stat-val" id="statMean">58.5%</div>
+        <div class="stat-val" id="statMean">60.3%</div>
       </div>
       <div class="stat-box">
         <div class="stat-label">Total Rent Claimed (Matched)</div>
-        <div class="stat-val" id="statClaimed">£426,845</div>
+        <div class="stat-val" id="statClaimed">£1,900,104</div>
       </div>
       <div class="stat-box">
         <div class="stat-label">Total RRO Awarded (Matched)</div>
-        <div class="stat-val" id="statAwarded">£364,613</div>
+        <div class="stat-val" id="statAwarded">£1,070,533</div>
       </div>
     </div>
 

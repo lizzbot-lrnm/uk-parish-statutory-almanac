@@ -172,6 +172,26 @@ test("live state (both gates): offer flips to InStock, CTA label exact", async (
   assert.equal(offerOf(jsonLd(html)).availability, "https://schema.org/InStock");
 });
 
+test("on-page and structured-data stats match the index behind /api/rro-search (no stale hard-coded figures)", async () => {
+  trapFetch();
+  const st = (await (await worker.fetch(get("/api/rro-search"), baseEnv())).json()).stats;
+  const { html } = await page(baseEnv());
+  const gbp = (v) => "£" + Math.round(v).toLocaleString("en-GB");
+  assert.match(html, new RegExp('id="statCount">' + st.total_matched + "<"));
+  assert.match(html, new RegExp('id="statMedian">' + st.median_award_pct + "%<"));
+  assert.match(html, new RegExp('id="statMean">' + st.mean_award_pct + "%<"));
+  assert.ok(html.includes('id="statClaimed">' + gbp(st.total_claimed_gbp) + "<"));
+  assert.ok(html.includes('id="statAwarded">' + gbp(st.total_awarded_gbp) + "<"));
+  const ld = jsonLd(html);
+  const faqText = ld["@graph"].find((n) => n["@type"] === "FAQPage").mainEntity.map((q) => q.acceptedAnswer.text).join(" ");
+  assert.ok(faqText.includes("index of " + st.total_indexed_rulings + " published decisions"));
+  assert.ok(faqText.includes("is " + st.median_award_pct + "% and the mean is " + st.mean_award_pct + "%"));
+  for (const d of [DESC, ld["@graph"].find((n) => n["@type"] === "Dataset").description]) {
+    assert.ok(d.includes(String(st.total_indexed_rulings)), d);
+  }
+  assert.ok(DESC.includes(st.median_award_pct + "% median"));
+});
+
 test("sitemap.xml lists /rro (not /rro/stats) and robots.txt allows /rro and points at the sitemap", async () => {
   trapFetch();
   const sm = await worker.fetch(get("/sitemap.xml"), baseEnv());
