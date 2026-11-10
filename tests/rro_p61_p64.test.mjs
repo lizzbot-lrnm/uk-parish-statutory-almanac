@@ -3,6 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { rroAlert, rroResetIsolateStateForTests, RRO_ALERT_EVENT, RRO_ALERT_UNTHROTTLED } from "../src/rro_core.js";
 import { captureLogs } from "./rro_batch_helpers.mjs";
 
@@ -119,4 +120,10 @@ test("P70: if the rollback call itself throws or fails, the error shows ROLLBACK
   }
   const thrown = runDeploy(src, { ...bad, rollbackPost: () => { throw new Error("HTTP 503 network down"); } });
   await assert.rejects(thrown.done, /ROLLBACK FAILED \(HTTP 503 network down\)/);
+});
+
+test("Bootstrap: the docs say the script can't deploy a brand-new Worker and how to bootstrap one", () => {
+  const doc = readFileSync(new URL("../deploy/RRO_STRIPE_CHECKOUT.md", import.meta.url), "utf8");
+  assert.match(doc, /### Bootstrapping a brand-new Worker \(the deploy script can't\)/);
+  for (const re of [/placeholder Worker/, /\*\*no route\*\*/, /RRO_IP_PEPPER/, /rollback target/, /attach the route/]) assert.match(doc, re);
 });

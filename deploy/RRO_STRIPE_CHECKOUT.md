@@ -133,3 +133,18 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - **P64:** `deploy/build_cf_execute.mjs` reads the rollback target (the version serving 100%) before writing anything. If it can't read it, or no single version is at 100%, it refuses and writes nothing. There is no "roll back by hand" fallback.
 - **P61:** after upload, the script sets the Worker's Workers Logs config through `script-settings`: `observability.enabled=true`, `head_sampling_rate=1`, `redact_query_string=true`, `logs.invocation_logs=false` (no visitor IP, user-agent or geo in stored logs), and `traces.enabled=false`. It then reads the config back. A mismatch, or a failed write or read, stops the deploy before the cron step and rolls back to the previous version. Script-level settings aren't versioned, so re-check them by hand after that rollback. To turn logs off entirely, PATCH `script-settings` with `{"observability":{"enabled":false}}`.
 - **P63:** `webhook_record_failed`, `pack_record_failed` and `webhook_paid_row_missing` alerts are never throttled. Every one is logged.
+
+### Bootstrapping a brand-new Worker (the deploy script can't)
+
+`deploy/build_cf_execute.mjs` is made for updating an existing Worker. It **refuses** to deploy a Worker that doesn't exist yet, or one that has never served a version, for two reasons:
+
+1. The P40 preflight requires the secret **name** `RRO_IP_PEPPER` to be bound already. The script never writes secrets.
+2. The P64 preflight requires a readable rollback target, which means one version serving 100%.
+
+Both refusals happen before anything is written. That is intended, so don't weaken either check to get a first deploy through. To bootstrap a new Worker (for example in a new account, or after a delete), do this once, by hand, with the fleet Cloudflare token and the sign-off of the reviewer and owner:
+
+1. Upload a minimal placeholder Worker under the target script name, with **no route** and no custom domain. A module that returns `503` for every request is enough. This creates the script and a first version at 100%.
+2. Bind the secrets with `PUT /accounts/{id}/workers/scripts/{script}/secrets` (`type: secret_text`): `RRO_IP_PEPPER`, and `RRO_TELEMETRY_TOKEN` if used. Take the values from the secret store and never print or commit them. Stripe secrets and `RRO_STRIPE_LIVE_ENABLED` stay unset.
+3. Read back the names only (`GET .../settings`) and the deployments (`GET .../deployments`, one version at 100%).
+4. Run the normal deploy: `node deploy/build_cf_execute.mjs "<message>"`. The script creates or binds the D1 database, uploads, re-checks the secret names, sets and verifies the P61 observability config, and registers the cron. Its rollback target is the placeholder.
+5. Run the post-checks. Only after they pass, attach the route (`parish.technoplusit.co.uk/*`) and record its id and the rollback (delete the route) in the deploy record.
