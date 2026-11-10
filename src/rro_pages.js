@@ -256,7 +256,77 @@ async function rroHandleCheckoutRoutes(request, env, url) {
 //   live (review+owner gated) -> normal £24 CTA
 //   test + preview cookie/param -> CTA with an unmissable TEST MODE label
 //   test without preview, or not configured -> no CTA at all (production visitors never see test checkout)
-const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above.";
+const RRO_CTA_NOTE_TEXT = "One-off £24 via secure Stripe Checkout: formal Scott Schedule, Acheampong quantum workings, closest GOV.UK comparables, full regional precedent bundle (Markdown + CSV) and s.44 grounds &amp; appeal checklist, built from the inputs above. This is not legal advice and it does not file Form RRO1 for you.";
+// Disabled state (keys unset): describe the optional pack, say plainly it cannot be bought yet. No button.
+const RRO_CTA_DISABLED_TEXT = "Optional Export Formal Tribunal Appeal Pack (£24): a formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and appeal checklist, built from the calculator inputs above. Checkout is not enabled on this page yet, so this pack cannot be purchased today. Searching and CSV download stay free. This is not legal advice.";
+
+// ---- SEO: visible FAQ + JSON-LD built from one source so the two always match word-for-word ----
+const RRO_PAGE_URL = "https://parish.technoplusit.co.uk/rro";
+const RRO_PAGE_DESCRIPTION = "Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon.";
+const RRO_PACK_PRICE_GBP = "24.00";
+const RRO_FAQ = [
+  ["What is a rent repayment order?", "A rent repayment order is an order of the First-tier Tribunal (Property Chamber) requiring a landlord who has committed a specified housing offence to repay rent, or, where a local housing authority applies, rent paid through Housing Benefit or Universal Credit. The current list of offences and time limits is in official GOV.UK guidance. This page indexes published tribunal decisions; it does not replace that guidance."],
+  ["Who can apply?", "A tenant, or a local housing authority, may apply (Housing and Planning Act 2016 s.41). In England, local housing authorities are district, unitary and London borough councils (and the City of London bodies named in Housing Act 2004 s.261) — not parish or town councils. A local housing authority may apply only in respect of housing in its area, after serving a notice of intended proceedings."],
+  ["How much do tribunals award?", "In this index of 281 published decisions, the median award share shown on this page is 60% and the mean is 60.3%. That is a description of this dataset, not a guarantee or a recommended claim figure. Awards in individual cases range widely once utilities, Universal Credit / Housing Benefit, and other s.44 factors are taken into account."],
+  ["What changed on 1 May 2026?", "For qualifying offences committed on or after 1 May 2026, official guidance describes a longer maximum repayment period (up to 24 months’ rent) and a longer period in which to apply (two years). Offences committed before that date can still be subject to the earlier rules (including a 12-month cap and a one-year application window). Check the date of the alleged offence against current GOV.UK guidance before relying on either figure."],
+  ["What is free, and what is the £24 pack?", "Searching the index, downloading a regional or filtered CSV of published decisions, using the s.44 calculator, and running the private claim check are free. The optional “Export Formal Tribunal Appeal Pack” is a one-off £24 Stripe Checkout export of a formal Scott Schedule, quantum workings, closest published comparables, a regional precedent bundle, and a grounds and appeal checklist, built from the calculator inputs. It is not legal advice, it is not Form RRO1, and it does not file an application for you. If checkout is not yet enabled on this page, the pack cannot be purchased."],
+  ["Where does the data come from?", "The index is built from published First-tier Tribunal (Property Chamber) decisions on GOV.UK, reused under the Open Government Licence v3.0. It is not a complete record of every RRO ever made. Always open the official PDF linked from each row before relying on a case."],
+];
+function rroFaqHtml() {
+  const items = RRO_FAQ.map(([q, a]) => "      <dt>" + D.escapeHtml(q) + "</dt>\n      <dd>" + D.escapeHtml(a) + "</dd>").join("\n");
+  return '<div class="card faq" id="rro-faq">\n    <h2>3. Frequently asked questions</h2>\n    <dl>\n' + items + "\n    </dl>\n  </div>";
+}
+// The pack Offer only says InStock when the live CTA is actually shown. Every other state (keys unset,
+// malformed, test mode, test preview) says OutOfStock: the pack cannot be bought by a public visitor.
+function rroJsonLd(ctaState) {
+  const graph = [
+    {
+      "@type": "WebApplication",
+      "@id": RRO_PAGE_URL + "#app",
+      name: "Rent Repayment Order (RRO) tribunal precedents",
+      url: RRO_PAGE_URL,
+      description: RRO_PAGE_DESCRIPTION,
+      inLanguage: "en-GB",
+      applicationCategory: "LegalService",
+      operatingSystem: "Any (web browser)",
+      isAccessibleForFree: true,
+    },
+    {
+      "@type": "Product",
+      "@id": RRO_PAGE_URL + "#formal-pack",
+      name: "Export Formal Tribunal Appeal Pack",
+      description: "Optional one-off export built from the calculator inputs: formal Scott Schedule, quantum workings, closest published comparables, regional precedent bundle (Markdown and CSV), and a grounds and appeal checklist. Not legal advice; not Form RRO1.",
+      url: RRO_PAGE_URL,
+      offers: {
+        "@type": "Offer",
+        price: RRO_PACK_PRICE_GBP,
+        priceCurrency: "GBP",
+        url: RRO_PAGE_URL,
+        availability: ctaState === "live" ? "https://schema.org/InStock" : "https://schema.org/OutOfStock",
+      },
+    },
+    {
+      "@type": "FAQPage",
+      "@id": RRO_PAGE_URL + "#faq",
+      mainEntity: RRO_FAQ.map(([q, a]) => ({ "@type": "Question", name: q, acceptedAnswer: { "@type": "Answer", text: a } })),
+    },
+    {
+      "@type": "Dataset",
+      "@id": RRO_PAGE_URL + "#dataset",
+      name: "Published First-tier Tribunal Rent Repayment Order decisions (index)",
+      description: "Index of 281 published First-tier Tribunal (Property Chamber) Rent Repayment Order decisions on GOV.UK.",
+      url: RRO_PAGE_URL,
+      license: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
+      // The index is compiled by this site; HMCTS/GOV.UK only published the underlying decisions.
+      creator: { "@type": "Organization", name: "TechnoPlusIT" },
+      isBasedOn: "https://www.gov.uk/residential-property-tribunal-decisions",
+      isAccessibleForFree: true,
+    },
+  ];
+  // Escape "<" so no string can close the script element early.
+  const json = JSON.stringify({ "@context": "https://schema.org", "@graph": graph }).replace(/</g, "\\u003c");
+  return '<script type="application/ld+json" id="rroJsonLd">' + json + "</script>";
+}
 async function rroRenderRroPage(request, env, url) {
   const mode = rroStripeMode(env);
   const configured = mode.ok && Boolean(env && env.RRO_CHECKOUT_DB && rroWebhookSecret(env) && rroIpPepper(env));
@@ -267,7 +337,7 @@ async function rroRenderRroPage(request, env, url) {
   let state = "hidden";
   // Default (no usable Stripe test config, or a test key without preview): a plain "coming soon"
   // notice. No button, no link, no checkout call; X-RRO-CTA stays "hidden".
-  note = '<p id="formalPackComingSoon" style="font-size:13px;color:#475569;margin:6px 0 0;">Formal Tribunal Appeal Pack (£24): checkout coming soon.</p>';
+  note = '<p id="formalPackComingSoon" style="font-size:13px;color:#475569;margin:6px 0 0;">' + RRO_CTA_DISABLED_TEXT + "</p>";
   if (configured && mode.mode === "live") {
     state = "live";
     button = '<button id="formalPackBtn" type="button" style="background:#1d4ed8;">Export Formal Tribunal Appeal Pack — £24</button>';
@@ -280,7 +350,10 @@ async function rroRenderRroPage(request, env, url) {
       RRO_TEST_MODE_LABEL + ".</p>" +
       '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">Stripe test checkout (preview only). ' + RRO_CTA_NOTE_TEXT + "</p>";
   }
-  const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button).replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note);
+  const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", () => button)
+    .replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", () => note)
+    .replace("<!--RRO_JSONLD-->", () => rroJsonLd(state))
+    .replace("<!--RRO_FAQ_SECTION-->", () => rroFaqHtml());
   // The page varies on the preview cookie: never let a shared cache serve one visitor's variant to another.
   const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer", "Cache-Control": "private, no-store", Vary: "Cookie" };
   const cookies = [];
@@ -305,4 +378,4 @@ async function rroRenderRroPage(request, env, url) {
 }
 // --------------------------- end RRO checkout ---------------------------
 
-export { rroHandleCheckoutRoutes, rroRenderRroPage };
+export { rroHandleCheckoutRoutes, rroRenderRroPage, RRO_FAQ };
