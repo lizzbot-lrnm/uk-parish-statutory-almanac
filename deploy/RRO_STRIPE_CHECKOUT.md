@@ -23,7 +23,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 | `STRIPE_SECRET_KEY` | Worker secret | `sk_test_…`/`rk_test_…` first. A live key is **refused** unless `RRO_STRIPE_LIVE_ENABLED=true`. A restricted key needs Checkout Sessions: write. |
 | `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Leading/trailing whitespace or a newline is trimmed (as for `STRIPE_SECRET_KEY`); it must then be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
 | `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
-| `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Checkout and pack lookups return `503 CHECKOUT_NOT_CONFIGURED` without it. Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
+| `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Without it, checkout returns `503 CHECKOUT_NOT_CONFIGURED`, while `/api/rro/pack` and `/rro/pack/success` return the generic `503 UNAVAILABLE` (P16; the internal reason is logged only). Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
 | `RRO_STRIPE_LIVE_ENABLED` | plain var | Exactly `true` (case-sensitive, no whitespace; T4) **only after the live-mode security review passes and the site owner approves**. `TRUE`, `True`, `1` stay blocked. |
 | `RRO_CHECKOUT_LIVE_SINCE` | plain var | ISO-8601 UTC, set at live launch (Day-7 clock). |
@@ -66,6 +66,19 @@ The base branch is **`main`**. PR [#2](https://github.com/lizzbot-lrnm/uk-parish
 - `public_rate_limit_fallback` (pepper missing) and `public_rate_limit_d1_error`.
 
 Alert on any `rro_alert` from a Workers Logs query or a Logpush filter, and also on Stripe's own webhook-failure emails.
+
+**P55, throttling:** each alert type logs at most once per 60 s per isolate. The next line after a quiet window carries `suppressed: N`. Throttling is per type, so a flood of one type (for example unsigned webhooks) never hides another (for example `webhook_record_failed`). Workers Logs must be enabled on the script for these lines to be kept; at deploy 8 it was not.
+
+**P51, paid path and D1 write failures:** once Stripe has confirmed a session as paid, the buyer always gets the pack:
+- recording `paid` is best-effort, and a failure only logs the `pack_record_failed` alert. The Stripe-retried webhook records it later;
+- a lazy-schema write failure (`pack_schema_write_failed`) does not block the read;
+- a `pack_lookup` counter write error (`pack_counter_write_failed`) fails **open** only for sessions already recorded as paid. Unpaid sessions fail **closed** with a generic 503, so a D1 outage never opens the Stripe path.
+
+**P54, deploy guard:** `deploy/build_cf_execute.mjs` checks names before any write: it reads settings, then creates or reads D1, then uploads.
+- It refuses unless `RRO_IP_PEPPER` is bound.
+- It refuses if any binding named `RRO_STRIPE_LIVE_ENABLED` exists, unless the payload was built with `--live` (`node deploy/build_cf_execute.mjs "msg" --live`). That makes changing the live flag a deliberate act.
+- After the upload, a change in secret names means STOP. It rolls back automatically to the version that was serving 100% before, and the error says whether the rollback worked.
+- API errors show only Cloudflare's `errors` and `messages` arrays, never a whole response.
 
 ## Idempotency and caching
 - Each `/rro` view that shows the CTA sets `rro_bn`, a random 128-bit `HttpOnly; Secure; SameSite=Lax` cookie (24h), unless a valid one already exists. The Stripe `Idempotency-Key` is SHA-256 of mode, daily `ip_hash`, that nonce, the sorted cleaned inputs and a 10-minute bucket, so a retry or double submit from one browser reuses one Checkout Session, while two browsers behind one IP never share one. With no valid nonce, each request gets a fresh random key (no dedupe).

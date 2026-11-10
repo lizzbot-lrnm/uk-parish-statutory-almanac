@@ -225,9 +225,26 @@ async function rroD1CounterAdd(db, bucket, keyHash, delta, windowMinutes, nowMs)
 
 // P41: alert lines. One structured JSON log line per event (Workers Logs / Logpush pick these up); this
 // never sends anything externally. Callers pass no session ids, IPs or hashes.
+// P55: throttled per isolate to one line per alert type per RRO_ALERT_THROTTLE_MS; the next line after a
+// quiet window carries `suppressed` (how many were dropped). Keys are the fixed alert names, so the map is
+// bounded, and one noisy type (e.g. unsigned webhooks) can never hide another (e.g. webhook_record_failed).
 const RRO_ALERT_EVENT = "rro_alert";
-function rroAlert(alert, fields) {
-  console.log(JSON.stringify({ event: RRO_ALERT_EVENT, alert: String(alert), ...(fields || {}) }));
+const RRO_ALERT_THROTTLE_MS = 60 * 1000;
+const RRO_ALERT_STATE = new Map();
+const RRO_ALERT_STATE_MAX_KEYS = 64;
+function rroAlert(alert, fields, nowMs) {
+  const key = String(alert);
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const st = RRO_ALERT_STATE.get(key);
+  if (st && now - st.last < RRO_ALERT_THROTTLE_MS) {
+    st.suppressed += 1;
+    return false;
+  }
+  const suppressed = st ? st.suppressed : 0;
+  if (!st && RRO_ALERT_STATE.size >= RRO_ALERT_STATE_MAX_KEYS) RRO_ALERT_STATE.delete(RRO_ALERT_STATE.keys().next().value);
+  RRO_ALERT_STATE.set(key, { last: now, suppressed: 0 });
+  console.log(JSON.stringify({ event: RRO_ALERT_EVENT, alert: key, ...(fields || {}), ...(suppressed ? { suppressed } : {}) }));
+  return true;
 }
 
 let RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = false;
@@ -354,6 +371,7 @@ function rroResetIsolateStateForTests() {
   RRO_NOT_PAID_CACHE.clear();
   RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = false;
   RRO_ISOLATE_SALT = null;
+  RRO_ALERT_STATE.clear();
 }
 
 // P39 / P24: Content-Security-Policy for HTML pages. The allowed inline scripts are hashed from the TRUSTED
@@ -700,6 +718,7 @@ export {
   RRO_STRIPE_LOOKUP_GLOBAL_CAP,
   RRO_STRIPE_LOOKUP_SESSION_CAP,
   RRO_ALERT_EVENT,
+  RRO_ALERT_THROTTLE_MS,
   rroAlert,
   RRO_PUBLIC_RATE_LIMIT,
   RRO_IP_HASH_RETENTION_HOURS,

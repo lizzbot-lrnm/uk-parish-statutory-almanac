@@ -90,7 +90,7 @@ test("P40: the deploy refuses to upload when the secret NAME RRO_IP_PEPPER is no
   // Read the constant from source (importing the builder would print the whole payload to stdout).
   assert.match(readFileSync(new URL("../deploy/build_cf_execute.mjs", import.meta.url), "utf8"), /export const REQUIRED_SECRET_NAMES = \["RRO_IP_PEPPER"\];/);
   const missing = runDeploy(src, [{ type: "secret_text", name: "RRO_TELEMETRY_TOKEN" }]);
-  await assert.rejects(missing.done, /preflight: required secret name\(s\) not bound: RRO_IP_PEPPER \(nothing uploaded\)/);
+  await assert.rejects(missing.done, /preflight: required secret name\(s\) not bound: RRO_IP_PEPPER \(nothing written\)/);
   assert.ok(!missing.calls.includes(UPLOAD), "no upload without the pepper name");
   const good = [{ type: "secret_text", name: "RRO_IP_PEPPER" }, { type: "secret_text", name: "RRO_TELEMETRY_TOKEN" }];
   const ok = runDeploy(src, good);

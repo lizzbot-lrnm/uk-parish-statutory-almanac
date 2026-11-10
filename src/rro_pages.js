@@ -175,14 +175,31 @@ async function rroLoadPaidSession(env, sessionId, request) {
   const lim = RRO_LOOKUP_RATE_LIMIT;
   const rateLimited = { ok: false, status: 429, error: "RATE_LIMITED", retryAfterSec: rroRetryAfterSec(lim.window_minutes) };
   if (!(await rroCacheRateLimitHit("pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
-  await rroEnsureCheckoutSchema(db);
+  // P51: the lazy DDL is a D1 write; if writes are failing (e.g. quota) the tables already exist in
+  // production, so carry on to the read rather than refusing a buyer.
+  try {
+    await rroEnsureCheckoutSchema(db);
+  } catch (err) {
+    rroAlert("pack_schema_write_failed", { error: String((err && err.message) || err).slice(0, 200) });
+  }
   const known = await db
     .prepare("SELECT COUNT(*) AS n, MAX(kind = 'paid') AS paid FROM rro_checkout_events WHERE session_id = ?1 AND stripe_mode = ?2")
     .bind(sessionId, sessionMode)
     .first();
   if (!known || !Number(known.n)) return { ok: false, status: 404, error: "SESSION_NOT_FOUND" };
-  if (!(await rroD1CounterHit(db, "pack_lookup", ipHash, lim.max_hits, lim.window_minutes))) return rateLimited;
   const paidInD1 = Boolean(Number(known.paid));
+  // P51: a counter WRITE error fails open only for a session the verified webhook already recorded as paid
+  // (still bounded by the isolate/colo pre-filter above and the paid cache below); for unpaid sessions it
+  // fails closed with a generic 503, so a D1 outage never opens the Stripe path.
+  let lookupAllowed;
+  try {
+    lookupAllowed = await rroD1CounterHit(db, "pack_lookup", ipHash, lim.max_hits, lim.window_minutes);
+  } catch (err) {
+    rroAlert("pack_counter_write_failed", { paid: paidInD1, error: String((err && err.message) || err).slice(0, 200) });
+    if (!paidInD1) return { ok: false, status: 503, error: "COUNTER_UNAVAILABLE" };
+    lookupAllowed = true;
+  }
+  if (!lookupAllowed) return rateLimited;
   const cached = rroPaidCacheGet(sessionId) || (await rroPaidCacheApiGet(sessionId));
   if (cached && rroSessionIsPaidPack(cached) && cached.id === sessionId) {
     if (!rroSessionWithinWindow(cached)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
@@ -228,7 +245,13 @@ async function rroLoadPaidSession(env, sessionId, request) {
   if (!rroSessionWithinWindow(session)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
   // P41: Stripe says paid but no verified webhook has recorded it (late, or a delivery/processing failure).
   if (!paidInD1) rroAlert("webhook_paid_row_missing", { mode: sessionMode });
-  await rroRecordPaid(db, session);
+  // P51: Stripe has confirmed the payment, so recording it is best-effort: a D1 write failure is an alert,
+  // never a 500 for the buyer. The webhook (retried by Stripe) records it later.
+  try {
+    await rroRecordPaid(db, session);
+  } catch (err) {
+    rroAlert("pack_record_failed", { mode: sessionMode, error: String((err && err.message) || err).slice(0, 200) });
+  }
   const minimal = rroPaidCacheProject(session);
   rroPaidCachePut(sessionId, minimal);
   await rroPaidCacheApiPut(sessionId, minimal);
