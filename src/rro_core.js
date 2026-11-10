@@ -261,8 +261,15 @@ const RRO_ALERT_EVENT = "rro_alert";
 const RRO_ALERT_THROTTLE_MS = 60 * 1000;
 const RRO_ALERT_STATE = new Map();
 const RRO_ALERT_STATE_MAX_KEYS = 64;
+// P63: alerts about a real buyer's money are never throttled. They can only follow a verified (signed)
+// webhook or a Stripe-confirmed paid session, so an outsider cannot flood them.
+const RRO_ALERT_UNTHROTTLED = Object.freeze(new Set(["webhook_record_failed", "pack_record_failed", "webhook_paid_row_missing"]));
 function rroAlert(alert, fields, nowMs) {
   const key = String(alert);
+  if (RRO_ALERT_UNTHROTTLED.has(key)) {
+    console.log(JSON.stringify({ event: RRO_ALERT_EVENT, alert: key, ...(fields || {}) }));
+    return true;
+  }
   const now = typeof nowMs === "number" ? nowMs : Date.now();
   const st = RRO_ALERT_STATE.get(key);
   if (st && now - st.last < RRO_ALERT_THROTTLE_MS) {
@@ -756,6 +763,7 @@ export {
   RRO_STRIPE_LOOKUP_SESSION_CAP,
   RRO_ALERT_EVENT,
   RRO_ALERT_THROTTLE_MS,
+  RRO_ALERT_UNTHROTTLED,
   rroAlert,
   RRO_PUBLIC_RATE_LIMIT,
   RRO_IP_HASH_RETENTION_HOURS,
