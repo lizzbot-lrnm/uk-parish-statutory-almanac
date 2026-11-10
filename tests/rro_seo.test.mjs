@@ -11,7 +11,7 @@ import { RRO_FAQ } from "../src/rro_pages.js";
 const ORIGIN = "https://parish.technoplusit.co.uk";
 const CANON = ORIGIN + "/rro";
 const TITLE = "Rent Repayment Order (RRO) tribunal precedents";
-const DESC = "Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack.";
+const DESC = "Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon.";
 const H1 = "Rent Repayment Order (RRO) tribunal precedent finder";
 const FAKE_PEPPER = "unit-test-pepper-" + "not-a-real-secret-000";
 const FAKE_PREVIEW_SECRET = "unit-test-preview-" + "secret-not-real-000000";
@@ -73,6 +73,9 @@ test("SEO head: title, meta description, canonical, Open Graph and Twitter tags;
   assert.equal(meta("name", "twitter:card"), "summary");
   assert.equal(meta("name", "twitter:title"), TITLE);
   assert.equal(meta("name", "twitter:description"), DESC);
+  for (const d of [desc, meta("property", "og:description"), meta("name", "twitter:description"), jsonLd(html)["@graph"].find((n) => n["@type"] === "WebApplication").description]) {
+    assert.doesNotMatch(d, /export a formal pack/i);
+  }
   assert.equal(decode(html.match(/<h1>([^<]*)<\/h1>/)[1]), H1);
   assert.doesNotMatch(h, /Section 13\b/);
   assert.doesNotMatch(html.match(/<h1>[^<]*<\/h1>/)[0], /Section 13\b/);

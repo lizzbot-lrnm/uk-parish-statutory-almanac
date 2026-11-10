@@ -262,7 +262,7 @@ const RRO_CTA_DISABLED_TEXT = "Optional Export Formal Tribunal Appeal Pack (£24
 
 // ---- SEO: visible FAQ + JSON-LD built from one source so the two always match word-for-word ----
 const RRO_PAGE_URL = "https://parish.technoplusit.co.uk/rro";
-const RRO_PAGE_DESCRIPTION = "Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack.";
+const RRO_PAGE_DESCRIPTION = "Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon.";
 const RRO_PACK_PRICE_GBP = "24.00";
 const RRO_FAQ = [
   ["What is a rent repayment order?", "A rent repayment order is an order of the First-tier Tribunal (Property Chamber) requiring a landlord who has committed a specified housing offence to repay rent, or, where a local housing authority applies, rent paid through Housing Benefit or Universal Credit. The current list of offences and time limits is in official GOV.UK guidance. This page indexes published tribunal decisions; it does not replace that guidance."],

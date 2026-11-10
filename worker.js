@@ -2118,16 +2118,16 @@ const RRO_HTML_PAGE = `<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rent Repayment Order (RRO) tribunal precedents</title>
-  <meta name="description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <meta name="description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon." />
   <link rel="canonical" href="https://parish.technoplusit.co.uk/rro" />
   <meta property="og:type" content="website" />
   <meta property="og:locale" content="en_GB" />
   <meta property="og:url" content="https://parish.technoplusit.co.uk/rro" />
   <meta property="og:title" content="Rent Repayment Order (RRO) tribunal precedents" />
-  <meta property="og:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <meta property="og:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon." />
   <meta name="twitter:card" content="summary" />
   <meta name="twitter:title" content="Rent Repayment Order (RRO) tribunal precedents" />
-  <meta name="twitter:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award in this index, run a free calculator, or export a formal pack." />
+  <meta name="twitter:description" content="Search 281 published First-tier Tribunal Rent Repayment Order decisions. See the 60% median award and run a free calculator. Formal pack coming soon." />
   <!--RRO_JSONLD-->
   <style>
     :root { --bg: #f8fafc; --card: #ffffff; --ink: #0f172a; --muted: #475569; --accent: #0f766e; --border: #e2e8f0; --ok: #15803d; --blue: #1d4ed8; }
