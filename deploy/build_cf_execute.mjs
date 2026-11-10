@@ -5,7 +5,8 @@
 // P40/P54 preflight, before ANY write (D1 create, upload, schedules): refuses unless the secret NAME RRO_IP_PEPPER
 // is bound (names only; values are never read), and refuses if a binding named RRO_STRIPE_LIVE_ENABLED exists
 // unless the build was made with an explicit --live argument. After the upload, if the set of secret names
-// changed it STOPS and rolls back to the version that was serving before (and reports that). Error messages
+// changed it STOPS and rolls back to the version that was serving before (and reports that). P64: if that
+// rollback target cannot be read up front, it refuses before writing anything. Error messages
 // carry only the API's errors/messages arrays, never a whole response. Contains no secrets.
 import { readFileSync } from "node:fs";
 const MODULES = ["worker.js", "src/rro_core.js", "src/rro_checkout.js", "src/rro_pages.js"];
@@ -38,14 +39,17 @@ process.stdout.write(`async () => {
   if (missing.length) throw new Error("preflight: required secret name(s) not bound: " + missing.join(", ") + " (nothing written)");
   const liveFlag = ((settings && settings.bindings) || []).filter((b) => b.name === LIVE_FLAG_NAME).map((b) => b.type);
   if (liveFlag.length && !LIVE_ALLOWED) throw new Error("preflight: binding " + LIVE_FLAG_NAME + " is present (" + liveFlag.join(",") + ") but the build was not made with --live (nothing written)");
-  // Rollback target for the post-upload check: the version serving 100% right now (ids only).
-  let prevVersion = null;
-  try {
-    const deps = await cloudflare.request({ method: "GET", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\` });
-    const cur = deps && deps.success === true && deps.result && (deps.result.deployments || [])[0];
-    const v = cur && (cur.versions || []).find((x) => Number(x.percentage) === 100);
-    prevVersion = (v && v.version_id) || null;
-  } catch (_) {}
+  // P64: the rollback target (the version serving 100% right now, ids only) MUST be readable before anything
+  // is written: no silent "roll back by hand" fallback. Unreadable or ambiguous -> refuse, nothing written.
+  const deps = ok(await cloudflare.request({ method: "GET", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\` }), "read rollback target");
+  const curDep = deps && Array.isArray(deps.deployments) ? deps.deployments[0] : null;
+  const curFull = curDep && (curDep.versions || []).find((x) => Number(x.percentage) === 100);
+  const prevVersion = curFull && typeof curFull.version_id === "string" && curFull.version_id ? curFull.version_id : null;
+  if (!prevVersion) throw new Error("preflight: rollback target unreadable (no version serving 100%) (nothing written)");
+  const rollBack = async (why) => {
+    const rb = await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\`, body: { strategy: "percentage", versions: [{ version_id: prevVersion, percentage: 100 }], annotations: { "workers/message": "auto-rollback: " + why } } });
+    return rb && rb.success === true ? "rolled back to " + prevVersion : "ROLLBACK FAILED (" + JSON.stringify({ errors: (rb && rb.errors) || [] }) + "): roll back to " + prevVersion + " by hand";
+  };
   const list = ok(await cloudflare.request({ method: "GET", path: \`/accounts/\${accountId}/d1/database\`, query: { name: DB_NAME } }), "list D1");
   let db = (list || []).find((d) => d.name === DB_NAME);
   if (!db) db = ok(await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/d1/database\`, body: { name: DB_NAME } }), "create D1");
@@ -69,12 +73,7 @@ process.stdout.write(`async () => {
   const secretsAfter = secretNames(settingsAfter);
   if (JSON.stringify(secretsAfter) !== JSON.stringify(secretsBefore)) {
     // P54: STOP and roll back immediately to the version that was serving before this upload.
-    let rolledBack = "no previous version known: roll back by hand";
-    if (prevVersion) {
-      const rb = await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\`, body: { strategy: "percentage", versions: [{ version_id: prevVersion, percentage: 100 }], annotations: { "workers/message": "auto-rollback: secret names changed during deploy" } } });
-      rolledBack = rb && rb.success === true ? "rolled back to " + prevVersion : "ROLLBACK FAILED (" + JSON.stringify({ errors: (rb && rb.errors) || [] }) + "): roll back to " + prevVersion + " by hand";
-    }
-    throw new Error("smoke: secret names changed: " + JSON.stringify(secretsBefore) + " -> " + JSON.stringify(secretsAfter) + "; STOP, " + rolledBack);
+    throw new Error("smoke: secret names changed: " + JSON.stringify(secretsBefore) + " -> " + JSON.stringify(secretsAfter) + "; STOP, " + (await rollBack("secret names changed during deploy")));
   }
   // Retention cron is mandatory (T3): keep any existing schedules, ensure the hourly purge, then read it back.
   const SCHEDULES = \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/schedules\`;
