@@ -32,7 +32,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 Stripe webhook endpoint: `https://parish.technoplusit.co.uk/api/rro/stripe-webhook`, events `checkout.session.completed`, `checkout.session.async_payment_succeeded`.
 
 ## Fail-closed behaviour
-The Stripe webhook likewise returns `503 {"error":"WEBHOOK_NOT_CONFIGURED"}` and writes nothing unless both `STRIPE_SECRET_KEY` (usable: test, or live with the flag) and `STRIPE_WEBHOOK_SECRET` are set. Missing key / webhook secret / D1 / `RRO_IP_PEPPER`, or live key without the exact flag → `503 {"error":"CHECKOUT_NOT_CONFIGURED"}` with **no `detail`** (T5); Stripe is never called. Stripe returning a non-`checkout.stripe.com` URL → 502 (no open redirect); Stripe create failures return a generic `STRIPE_SESSION_CREATE_FAILED` with no upstream status.
+The Stripe webhook likewise returns `503 {"error":"WEBHOOK_NOT_CONFIGURED"}` and writes nothing unless both `STRIPE_SECRET_KEY` (usable: test, or live with the flag) and `STRIPE_WEBHOOK_SECRET` are set. Missing key / webhook secret / D1 / `RRO_IP_PEPPER`, or live key without the exact flag → `503 {"error":"CHECKOUT_NOT_CONFIGURED"}` on checkout and on pack/success lookups with **no `detail`** (T5); Stripe is never called. Stripe returning a non-`checkout.stripe.com` URL → 502 (no open redirect); Stripe create failures return a generic `STRIPE_SESSION_CREATE_FAILED` with no upstream status.
 
 ## T1: /rro CTA in test mode (production site)
 | State | What /rro shows |

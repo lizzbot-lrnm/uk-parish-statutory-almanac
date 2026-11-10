@@ -151,7 +151,7 @@ function rroSessionWithinWindow(session) {
 async function rroLoadPaidSession(env, sessionId, request) {
   if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
   const mode = rroStripeMode(env);
-  if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroIpPepper(env)) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
+  if (!mode.ok || !env.RRO_CHECKOUT_DB || !rroWebhookSecret(env) || !rroIpPepper(env)) return { ok: false, status: 503, error: "CHECKOUT_NOT_CONFIGURED" };
   const sessionMode = String(sessionId).startsWith("cs_live_") ? "live" : "test";
   if (sessionMode !== mode.mode) return { ok: false, status: 400, error: "SESSION_MODE_MISMATCH" };
   const db = env.RRO_CHECKOUT_DB;

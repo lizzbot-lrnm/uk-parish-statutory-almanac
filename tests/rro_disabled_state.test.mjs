@@ -114,6 +114,20 @@ test("disabled: public telemetry reports mode 'unavailable' and the £24 price; 
   assert.deepEqual(stripeCalls(), []);
 });
 
+test("disabled: a usable sk_test_ key but missing/malformed whsec -> pack lookups 503 with no Stripe call, even for a known session", async () => {
+  for (const wh of [undefined, "not-a-whsec-value-0000000000"]) {
+    trapFetch();
+    const e = noStripeEnv({ STRIPE_SECRET_KEY: "sk_test_" + "FAKEFAKEFAKE0123456789", STRIPE_WEBHOOK_SECRET: wh });
+    const sid = "cs_test_a1B2c3D4e5F6g7H8i9J0";
+    for (const sql of RRO_CHECKOUT_SCHEMA) e.RRO_CHECKOUT_DB._db.exec(sql);
+    e.RRO_CHECKOUT_DB._db.prepare("INSERT INTO rro_checkout_events (kind, stripe_mode, session_id, created_at_utc) VALUES ('checkout_start','test',?,?)").run(sid, new Date().toISOString());
+    for (const p of ["/rro/pack/success?session_id=" + sid, "/api/rro/pack?session_id=" + sid]) {
+      assert.equal((await worker.fetch(get(p), e)).status, 503, p);
+    }
+    assert.deepEqual(stripeCalls(), []);
+  }
+});
+
 test("L9: the legacy £29 intent-test offer is gone (all three paths 404, no £29 body)", async () => {
   trapFetch();
   for (const p of ["/api/rro-buy-pack?region=London", "/api/rro/buy-pack?region=London", "/api/rro/buy-pack/"]) {
