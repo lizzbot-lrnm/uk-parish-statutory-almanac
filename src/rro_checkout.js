@@ -17,6 +17,7 @@ import {
   rroWebhookSecret,
   rroEnsureCheckoutSchema,
   rroJson,
+  rroAlert,
   rroIpPepper,
   rroIpHash,
   rroPurgeIpHashes,
@@ -149,7 +150,10 @@ async function rroHandleStripeWebhook(request, env) {
   if (!webhookBody.ok) return rroJson({ status: "error", error: "PAYLOAD_TOO_LARGE" }, 413);
   const rawBody = webhookBody.text;
   const ver = await rroVerifyStripeSignature(rawBody, request.headers.get("Stripe-Signature"), rroWebhookSecret(env));
-  if (!ver.ok) return rroJson({ status: "error", error: "SIGNATURE_VERIFICATION_FAILED" }, 400);
+  if (!ver.ok) {
+    rroAlert("webhook_signature_failed", { mode: mode.mode });
+    return rroJson({ status: "error", error: "SIGNATURE_VERIFICATION_FAILED" }, 400);
+  }
   let event;
   try {
     event = JSON.parse(rawBody);
@@ -168,13 +172,21 @@ async function rroHandleStripeWebhook(request, env) {
   // live events are refused unless the Worker is in (gated) live mode.
   const expectLive = mode.mode === "live";
   if (session.livemode !== expectLive || String(session.id).startsWith("cs_live_") !== (session.livemode === true)) {
+    rroAlert("webhook_mode_mismatch", { mode: mode.mode });
     return rroJson({ status: "error", error: "MODE_MISMATCH" }, 400);
   }
-  const inserted = await rroRecordPaid(env.RRO_CHECKOUT_DB, session);
+  let inserted;
+  try {
+    inserted = await rroRecordPaid(env.RRO_CHECKOUT_DB, session);
+  } catch (err) {
+    // P41: a failed D1 write must be visible; rethrown so the generic 500 makes Stripe retry the delivery.
+    rroAlert("webhook_record_failed", { mode: mode.mode, error: String((err && err.message) || err).slice(0, 200) });
+    throw err;
+  }
   try {
     await rroPurgeIpHashesBounded(env.RRO_CHECKOUT_DB, RRO_OPPORTUNISTIC_PURGE_LIMIT);
   } catch (err) {
-    console.log(JSON.stringify({ event: "rro_webhook_purge_failed", error: String((err && err.message) || err).slice(0, 200) }));
+    rroAlert("webhook_purge_failed", { error: String((err && err.message) || err).slice(0, 200) });
   }
   return rroJson({ status: "ok", recorded: inserted, duplicate: !inserted });
 }

@@ -99,15 +99,17 @@ test("P15: the D1 total is global — spreading requests over isolates/colos is 
   assert.ok(admitted < RRO_PUBLIC_RATE_LIMIT.max_hits + 2 * RRO_PUBLIC_RATE_LIMIT.flush_every, "admitted " + admitted);
 });
 
-test("P15: fails open without the pepper or when D1 errors (free public tools stay up); never stores a raw IP", async () => {
+test("P15/P40: without the pepper the local limiter still applies (no D1 writes); a D1 error fails open per hit; never stores a raw IP", async () => {
   const noPepper = disabledEnv({ RRO_IP_PEPPER: undefined });
-  for (let i = 0; i < RRO_PUBLIC_RATE_LIMIT.max_hits + 5; i++) assert.equal((await worker.fetch(get("/api/rro-search?limit=1"), noPepper)).status, 200);
+  for (let i = 0; i < RRO_PUBLIC_RATE_LIMIT.max_hits; i++) assert.equal((await worker.fetch(get("/api/rro-search?limit=1"), noPepper)).status, 200);
+  assert.equal((await worker.fetch(get("/api/rro-search?limit=1"), noPepper)).status, 429, "P40: no fail-open without the pepper");
   assert.deepEqual(noPepper.RRO_CHECKOUT_DB._writes, []);
+  rroResetIsolateStateForTests();
   const broken = disabledEnv({ RRO_CHECKOUT_DB: { prepare: () => { throw new Error("d1 down"); }, batch: async () => { throw new Error("d1 down"); } } });
   const logs = await captureLogs(async () => {
     for (let i = 0; i < 20; i++) assert.equal((await worker.fetch(get("/api/rro-search?limit=1"), broken)).status, 200);
   });
-  assert.ok(logs.some((l) => l.includes("rro_public_rate_limit_d1_error")));
+  assert.ok(logs.some((l) => l.includes("\"rro_alert\"") && l.includes("public_rate_limit_d1_error")));
   // The colo limit still applies when D1 is down.
   await captureLogs(async () => {
     for (let i = 20; i < RRO_PUBLIC_RATE_LIMIT.max_hits; i++) assert.equal((await worker.fetch(get("/api/rro-search?limit=1"), broken)).status, 200);

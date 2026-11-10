@@ -797,7 +797,7 @@ test("G4: the deploy build registers the mandatory hourly cron, keeps existing o
     const cloudflare = { request: async ({ method, path, body }) => {
       calls.push(method + " " + path);
       if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
-      if (path.endsWith("/settings")) return { success: true, result: { bindings: [] } };
+      if (path.endsWith("/settings")) return { success: true, result: { bindings: [{ type: "secret_text", name: "RRO_IP_PEPPER" }] } };
       if (path.endsWith("/schedules") && method === "PUT") { schedules = verifyDrops ? [] : body; return { success: true, result: { schedules } }; }
       if (path.endsWith("/schedules")) return { success: true, result: { schedules } };
       return { success: true, result: { etag: "e" } };
