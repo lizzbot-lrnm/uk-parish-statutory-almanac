@@ -75,6 +75,8 @@ function runDeploy(src, bindingsBefore, bindingsAfter = bindingsBefore) {
   const cloudflare = { request: async ({ method, path, body }) => {
     calls.push(method + " " + path);
     if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
+      if (path.endsWith("/deployments") && method === "GET") return { success: true, result: { deployments: [{ id: "d-prev", versions: [{ version_id: "v-prev", percentage: 100 }] }] } };
+    if (path.endsWith("/script-settings")) return method === "PATCH" ? { success: true, result: {} } : { success: true, result: { observability: { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } } } };
     if (path.endsWith("/settings")) return { success: true, result: { bindings: settingsReads++ === 0 ? bindingsBefore : bindingsAfter } };
     if (path.endsWith("/schedules") && method === "PUT") { schedules = body; return { success: true, result: { schedules } }; }
     if (path.endsWith("/schedules")) return { success: true, result: { schedules } };
@@ -90,7 +92,7 @@ test("P40: the deploy refuses to upload when the secret NAME RRO_IP_PEPPER is no
   // Read the constant from source (importing the builder would print the whole payload to stdout).
   assert.match(readFileSync(new URL("../deploy/build_cf_execute.mjs", import.meta.url), "utf8"), /export const REQUIRED_SECRET_NAMES = \["RRO_IP_PEPPER"\];/);
   const missing = runDeploy(src, [{ type: "secret_text", name: "RRO_TELEMETRY_TOKEN" }]);
-  await assert.rejects(missing.done, /preflight: required secret name\(s\) not bound: RRO_IP_PEPPER \(nothing uploaded\)/);
+  await assert.rejects(missing.done, /preflight: required secret name\(s\) not bound: RRO_IP_PEPPER \(nothing written\)/);
   assert.ok(!missing.calls.includes(UPLOAD), "no upload without the pepper name");
   const good = [{ type: "secret_text", name: "RRO_IP_PEPPER" }, { type: "secret_text", name: "RRO_TELEMETRY_TOKEN" }];
   const ok = runDeploy(src, good);

@@ -23,7 +23,8 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 | `STRIPE_SECRET_KEY` | Worker secret | `sk_test_…`/`rk_test_…` first. A live key is **refused** unless `RRO_STRIPE_LIVE_ENABLED=true`. A restricted key needs Checkout Sessions: write. |
 | `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Leading/trailing whitespace or a newline is trimmed (as for `STRIPE_SECRET_KEY`); it must then be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
 | `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
-| `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Checkout and pack lookups return `503 CHECKOUT_NOT_CONFIGURED` without it. Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
+| `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Without it, checkout returns `503 CHECKOUT_NOT_CONFIGURED`, while `/api/rro/pack` and `/rro/pack/success` return the generic `503 UNAVAILABLE` (P16; the internal reason is logged only). Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
+| `RRO_CHECKOUT_DAILY_CAP` | Plain var (optional) | P53: global ceiling on **new** Stripe Checkout sessions per UTC day, all IPs together. The default is **50** new checkout sessions per UTC day (`RRO_CHECKOUT_DAILY_CAP_DEFAULT` in `src/rro_core.js`). Set an integer from 1 to 10000 to raise it; anything else falls back to 50, never to unlimited. Over the cap, or on a counter error, checkout returns a generic `503 CHECKOUT_UNAVAILABLE` and Stripe is not called. Paid buyers' pack and success lookups never touch it. |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
 | `RRO_STRIPE_LIVE_ENABLED` | plain var | Exactly `true` (case-sensitive, no whitespace; T4) **only after the live-mode security review passes and the site owner approves**. `TRUE`, `True`, `1` stay blocked. |
 | `RRO_CHECKOUT_LIVE_SINCE` | plain var | ISO-8601 UTC, set at live launch (Day-7 clock). |
@@ -67,6 +68,24 @@ The base branch is **`main`**. PR [#2](https://github.com/lizzbot-lrnm/uk-parish
 
 Alert on any `rro_alert` from a Workers Logs query or a Logpush filter, and also on Stripe's own webhook-failure emails.
 
+**P53, daily checkout ceiling:** this is `rro_rate_counters`, bucket `checkout_daily`, key `global`, with one row per UTC day. It is counted with the same conditional upsert, after the per-IP limit, so one IP's refused attempts never use up the day.
+- The row is kept 48 h, because the hourly purge skips it until then.
+- `checkout_daily_volume_high` is logged once the day reaches 50% of the cap, and `checkout_daily_cap_hit` at the cap. Both are throttled as in P55.
+- `checkout_daily_counter_failed` is logged on a counter error (fail closed).
+
+**P55, throttling:** each alert type logs at most once per 60 s per isolate. The next line after a quiet window carries `suppressed: N`. Throttling is per type, so a flood of one type (for example unsigned webhooks) never hides another (for example `webhook_record_failed`). Workers Logs must be enabled on the script for these lines to be kept; at deploy 8 it was not.
+
+**P51, paid path and D1 write failures:** once Stripe has confirmed a session as paid, the buyer always gets the pack:
+- recording `paid` is best-effort, and a failure only logs the `pack_record_failed` alert. The Stripe-retried webhook records it later;
+- a lazy-schema write failure (`pack_schema_write_failed`) does not block the read;
+- a `pack_lookup` counter write error (`pack_counter_write_failed`) fails **open** only for sessions already recorded as paid. Unpaid sessions fail **closed** with a generic 503, so a D1 outage never opens the Stripe path.
+
+**P54, deploy guard:** `deploy/build_cf_execute.mjs` checks names before any write: it reads settings, then creates or reads D1, then uploads.
+- It refuses unless `RRO_IP_PEPPER` is bound.
+- It refuses if any binding named `RRO_STRIPE_LIVE_ENABLED` exists, unless the payload was built with `--live` (`node deploy/build_cf_execute.mjs "msg" --live`). That makes changing the live flag a deliberate act.
+- After the upload, a change in secret names means STOP. It rolls back automatically to the version that was serving 100% before, and the error says whether the rollback worked.
+- API errors show only Cloudflare's `errors` and `messages` arrays, never a whole response.
+
 ## Idempotency and caching
 - Each `/rro` view that shows the CTA sets `rro_bn`, a random 128-bit `HttpOnly; Secure; SameSite=Lax` cookie (24h), unless a valid one already exists. The Stripe `Idempotency-Key` is SHA-256 of mode, daily `ip_hash`, that nonce, the sorted cleaned inputs and a 10-minute bucket, so a retry or double submit from one browser reuses one Checkout Session, while two browsers behind one IP never share one. With no valid nonce, each request gets a fresh random key (no dedupe).
 - `caches.default` keys all live under `https://parish.technoplusit.co.uk/__rro_internal_cache/v1/` (`paid/<session_id>`, `stats`, `rl/<bucket>/<ip_hash>/<window>`); no public route serves that prefix (404).
@@ -108,3 +127,9 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - Checkout DDL runs once per isolate (a module-level promise, retried after a failure).
 - **Accepted LOW:** the public `/api/rro/telemetry` keeps `mode` (`test`/`live`/`unavailable`) and `price_gbp`. They are the documented public contract the smoke test reads, and the price is already shown on the page.
 
+
+### Deploy script safety (P61, P63, P64)
+
+- **P64:** `deploy/build_cf_execute.mjs` reads the rollback target (the version serving 100%) before writing anything. If it can't read it, or no single version is at 100%, it refuses and writes nothing. There is no "roll back by hand" fallback.
+- **P61:** after upload, the script sets the Worker's Workers Logs config through `script-settings`: `observability.enabled=true`, `head_sampling_rate=1`, `redact_query_string=true`, `logs.invocation_logs=false` (no visitor IP, user-agent or geo in stored logs), and `traces.enabled=false`. It then reads the config back. A mismatch, or a failed write or read, stops the deploy before the cron step and rolls back to the previous version. Script-level settings aren't versioned, so re-check them by hand after that rollback. To turn logs off entirely, PATCH `script-settings` with `{"observability":{"enabled":false}}`.
+- **P63:** `webhook_record_failed`, `pack_record_failed` and `webhook_paid_row_missing` alerts are never throttled. Every one is logged.
