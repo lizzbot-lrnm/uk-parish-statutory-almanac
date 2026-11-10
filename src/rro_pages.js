@@ -317,7 +317,9 @@ function rroJsonLd(ctaState) {
       description: "Index of 281 published First-tier Tribunal (Property Chamber) Rent Repayment Order decisions on GOV.UK.",
       url: RRO_PAGE_URL,
       license: "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",
-      creator: { "@type": "Organization", name: "HM Courts & Tribunals Service (decisions published on GOV.UK)" },
+      // The index is compiled by this site; HMCTS/GOV.UK only published the underlying decisions.
+      creator: { "@type": "Organization", name: "TechnoPlusIT" },
+      isBasedOn: "https://www.gov.uk/residential-property-tribunal-decisions",
       isAccessibleForFree: true,
     },
   ];
@@ -348,10 +350,10 @@ async function rroRenderRroPage(request, env, url) {
       RRO_TEST_MODE_LABEL + ".</p>" +
       '<p id="formalPackNote" style="font-size:13px;color:#475569;margin:6px 0 0;">Stripe test checkout (preview only). ' + RRO_CTA_NOTE_TEXT + "</p>";
   }
-  const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", button)
-    .replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", note)
-    .replace("<!--RRO_JSONLD-->", rroJsonLd(state))
-    .replace("<!--RRO_FAQ_SECTION-->", rroFaqHtml());
+  const html = D.RRO_HTML_PAGE.replace("<!--RRO_FORMAL_PACK_CTA_BUTTON-->", () => button)
+    .replace("<!--RRO_FORMAL_PACK_CTA_NOTE-->", () => note)
+    .replace("<!--RRO_JSONLD-->", () => rroJsonLd(state))
+    .replace("<!--RRO_FAQ_SECTION-->", () => rroFaqHtml());
   // The page varies on the preview cookie: never let a shared cache serve one visitor's variant to another.
   const extra = { "X-RRO-CTA": state, "Referrer-Policy": "no-referrer", "Cache-Control": "private, no-store", Vary: "Cookie" };
   const cookies = [];

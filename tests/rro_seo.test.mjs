@@ -190,6 +190,8 @@ test("on-page and structured-data stats match the index behind /api/rro-search (
     assert.ok(d.includes(String(st.total_indexed_rulings)), d);
   }
   assert.ok(DESC.includes(st.median_award_pct + "% median"));
+  const ds = ld["@graph"].find((n) => n["@type"] === "Dataset");
+  assert.doesNotMatch(JSON.stringify(ds.creator), /HMCTS|Courts|GOV\.UK/i, "the index is not presented as an official dataset");
 });
 
 test("sitemap.xml lists /rro (not /rro/stats) and robots.txt allows /rro and points at the sitemap", async () => {
