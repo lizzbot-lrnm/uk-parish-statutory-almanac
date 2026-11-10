@@ -47,6 +47,8 @@ const RRO_CHECKOUT_SCHEMA = [
   "CREATE INDEX IF NOT EXISTS ix_rro_checkout_ip_time ON rro_checkout_events(ip_hash, created_at_utc)",
   "CREATE TABLE IF NOT EXISTS rro_rate_hits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, ip_hash TEXT NOT NULL, created_at_utc TEXT NOT NULL)",
   "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits ON rro_rate_hits(bucket, ip_hash, created_at_utc)",
+  // TC2: the retention purge filters on created_at_utc alone; without this it is a full table scan.
+  "CREATE INDEX IF NOT EXISTS ix_rro_rate_hits_created_at ON rro_rate_hits(created_at_utc)",
 ];
 // One DDL batch per isolate: a module-level promise (a D1 binding wrapper is not a stable WeakSet key).
 // A failed batch clears the promise so the next request retries.
@@ -65,6 +67,14 @@ function rroStripeMode(env) {
     return { ok: false, mode: "live_blocked", reason: "LIVE_KEY_PRESENT_BUT_RRO_STRIPE_LIVE_ENABLED_NOT_TRUE" };
   }
   return { ok: false, mode: "unconfigured", reason: "STRIPE_SECRET_KEY_UNRECOGNISED_PREFIX" };
+}
+
+// The webhook signing secret is read only from env and must be whsec_-shaped; anything else is
+// treated as missing, so checkout stays disabled and the webhook answers 503 (fail closed).
+const RRO_WEBHOOK_SECRET_RE = /^whsec_[A-Za-z0-9_+/=-]{16,}$/;
+function rroWebhookSecret(env) {
+  const s = env && env.STRIPE_WEBHOOK_SECRET;
+  return typeof s === "string" && RRO_WEBHOOK_SECRET_RE.test(s) ? s : null;
 }
 
 function rroEnsureCheckoutSchema(db) {
@@ -431,6 +441,7 @@ export {
   rroPurgeIpHashesBounded,
   rroResetIsolateStateForTests,
   rroStripeMode,
+  rroWebhookSecret,
   rroEnsureCheckoutSchema,
   rroJson,
   rroIpPepper,
