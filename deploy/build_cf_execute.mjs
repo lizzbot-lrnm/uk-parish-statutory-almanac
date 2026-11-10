@@ -46,8 +46,15 @@ process.stdout.write(`async () => {
   const curFull = curDep && (curDep.versions || []).find((x) => Number(x.percentage) === 100);
   const prevVersion = curFull && typeof curFull.version_id === "string" && curFull.version_id ? curFull.version_id : null;
   if (!prevVersion) throw new Error("preflight: rollback target unreadable (no version serving 100%) (nothing written)");
+  // P70: a rollback call that throws (network/API error) must not hide the original failure: the caller
+  // always gets a string, and the thrown error carries both the original reason and "ROLLBACK FAILED".
   const rollBack = async (why) => {
-    const rb = await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\`, body: { strategy: "percentage", versions: [{ version_id: prevVersion, percentage: 100 }], annotations: { "workers/message": "auto-rollback: " + why } } });
+    let rb;
+    try {
+      rb = await cloudflare.request({ method: "POST", path: \`/accounts/\${accountId}/workers/scripts/\${SCRIPT}/deployments\`, body: { strategy: "percentage", versions: [{ version_id: prevVersion, percentage: 100 }], annotations: { "workers/message": "auto-rollback: " + why } } });
+    } catch (e) {
+      return "ROLLBACK FAILED (" + String((e && e.message) || e).slice(0, 300) + "): roll back to " + prevVersion + " by hand";
+    }
     return rb && rb.success === true ? "rolled back to " + prevVersion : "ROLLBACK FAILED (" + JSON.stringify({ errors: (rb && rb.errors) || [] }) + "): roll back to " + prevVersion + " by hand";
   };
   const OBSERVABILITY = { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false } };
