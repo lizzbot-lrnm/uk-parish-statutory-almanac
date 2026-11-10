@@ -145,3 +145,43 @@ test("P30: hostile record — script/attribute injection in every field is escap
   const attrs = [...out.matchAll(/<(\w+)((?:\s+[\w-]+="[^"]*")*)\s*\/?>/g)].flatMap((m) => [...m[2].matchAll(/([\w-]+)="/g)].map((a) => a[1]));
   for (const a of attrs) assert.ok(["class", "style"].includes(a), "unexpected attribute " + a);
 });
+
+// ---------------------------------------------------------------- P37: claim check only on explicit user action
+async function loadRroScript() {
+  const html = await (await worker.fetch(get("/rro"), env())).text();
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])[0];
+  const els = new Map(); const listeners = new Map();
+  const el = (id) => {
+    if (!els.has(id)) els.set(id, { id, value: id === "privateText" ? "Draft claim text" : "", textContent: "", innerHTML: "", href: "",
+      addEventListener(type, fn) { listeners.set(id + ":" + type, fn); } });
+    return els.get(id);
+  };
+  const audits = [];
+  const ctx = {
+    document: { getElementById: el }, window: { location: { search: "" } },
+    URL, URLSearchParams, JSON, Number, String, Array, Math, console, setTimeout,
+    fetch: (u, init) => {
+      if (String(u).startsWith("/api/rro-audit-pdf")) { audits.push(init); return Promise.resolve({ ok: true, json: async () => ({ status: "ok" }) }); }
+      if (String(u).startsWith("/api/rro-search")) return Promise.resolve({ ok: true, json: async () => ({ stats: { total_matched: 0, median_award_pct: 0, mean_award_pct: 0, total_claimed_gbp: 0, total_awarded_gbp: 0 }, results: [] }) });
+      return new Promise(() => {});
+    },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(script, ctx);
+  await new Promise((r) => setTimeout(r, 30));
+  return { html, audits, listeners, el };
+}
+
+test("P37: the /rro script sends no claim-check request on load; an explicit click still runs it; textarea has autocomplete=off", async () => {
+  const { html, audits, listeners, el } = await loadRroScript();
+  assert.equal(audits.length, 0, "no POST /api/rro-audit-pdf on page load");
+  assert.match(html, /<textarea id="privateText" autocomplete="off">/);
+  const click = listeners.get("auditBtn:click");
+  assert.equal(typeof click, "function", "auditBtn has a click handler");
+  await click();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(audits.length, 1, "explicit click sends exactly one claim check");
+  assert.equal(audits[0].method, "POST");
+  assert.deepEqual(JSON.parse(audits[0].body), { claim_text: "Draft claim text" });
+  assert.match(el("auditOutput").textContent, /"status": "ok"/);
+});
