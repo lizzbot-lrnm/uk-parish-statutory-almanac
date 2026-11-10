@@ -32,8 +32,12 @@ const RRO_PAID_CACHE_TTL_MS = 10 * 60 * 1000;
 // P2: a "not paid" (or Stripe-404) verdict for a known session is cached for 30 s, so a polling or
 // hostile client cannot make one Stripe call per request. A webhook-recorded 'paid' row bypasses it.
 const RRO_NOT_PAID_CACHE_TTL_MS = 30 * 1000;
-// P2: global cap on Stripe session lookups (all IPs together), D1-backed so it holds across colos.
-const RRO_STRIPE_LOOKUP_GLOBAL_CAP = { max_hits: 300, window_minutes: 10 };
+// P2/P41: Stripe session lookups for sessions not yet recorded as paid are bounded twice, both D1-backed so
+// they hold across colos: (a) per session (an attacker's own sessions cannot spend more than this each), and
+// (b) a global ceiling, sized so it takes ~200 attacker sessions per window (40+ /64s at 5 starts each) to
+// reach it. A single global bucket alone let ~10-15 polled sessions lock out a real buyer (P41).
+const RRO_STRIPE_LOOKUP_SESSION_CAP = { max_hits: 6, window_minutes: 10 };
+const RRO_STRIPE_LOOKUP_GLOBAL_CAP = { max_hits: 1200, window_minutes: 10 };
 // P15: per-IP limit on the public search + calculate API (GET and POST, every path alias), one shared bucket.
 // The colo counter (isolate Map + caches.default) costs no D1 write and is best-effort per colo (two isolates
 // can race on the cache read/put, so a colo may over- or under-count by a few); every flush_every-th admitted
@@ -219,23 +223,49 @@ async function rroD1CounterAdd(db, bucket, keyHash, delta, windowMinutes, nowMs)
   return Number((row && row.n) || 0);
 }
 
+// P41: alert lines. One structured JSON log line per event (Workers Logs / Logpush pick these up); this
+// never sends anything externally. Callers pass no session ids, IPs or hashes.
+const RRO_ALERT_EVENT = "rro_alert";
+function rroAlert(alert, fields) {
+  console.log(JSON.stringify({ event: RRO_ALERT_EVENT, alert: String(alert), ...(fields || {}) }));
+}
+
 let RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = false;
+// P40: random salt generated once per isolate, used only when RRO_IP_PEPPER is missing. It never leaves the
+// isolate and is never written to D1, so the fallback keys cannot be linked to an address after the isolate dies.
+let RRO_ISOLATE_SALT = null;
+function rroIsolateSalt() {
+  if (!RRO_ISOLATE_SALT) {
+    const b = new Uint8Array(32);
+    crypto.getRandomValues(b);
+    RRO_ISOLATE_SALT = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  return RRO_ISOLATE_SALT;
+}
+async function rroFallbackIpKey(request) {
+  const ip = rroIpBucket(request.headers.get("CF-Connecting-IP") || "unknown");
+  return "nopepper-" + (await rroHmacSha256Hex(rroIsolateSalt(), ip)).slice(0, 32);
+}
 // P15: per-IP limit for the public search/calculate API. Returns { allowed, retryAfterSec }.
-// Fails OPEN (allowed, logged) if the pepper is missing or D1 errors: these are free public tools over
-// public OGL data, so an infrastructure fault must not take them offline. The colo limit still applies.
+// P40: with no RRO_IP_PEPPER it does NOT fail open: it falls back to the local limiter only (isolate Map +
+// caches.default in this data centre), keyed by an HMAC of the /64 or IPv4 with the per-isolate salt above.
+// Because the salt differs per isolate, that fallback is per isolate (not shared across a colo or globally)
+// and has no D1 flush; the zone rate-limiting rule (P42) is the cross-colo backstop. A D1 error on the flush
+// still fails open for that one hit (free public tools over public OGL data), and is logged as an alert.
 async function rroPublicRateLimit(request, env, bucket, nowMs) {
   const now = typeof nowMs === "number" ? nowMs : Date.now();
   const lim = RRO_PUBLIC_RATE_LIMIT;
   const ipHash = await rroIpHash(request, env || {});
+  const limited = { allowed: false, retryAfterSec: rroRetryAfterSec(lim.window_minutes, now) };
   if (!ipHash) {
     if (!RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED) {
       RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = true;
-      console.log(JSON.stringify({ event: "rro_public_rate_limit_disabled", reason: "RRO_IP_PEPPER_MISSING" }));
+      rroAlert("public_rate_limit_fallback", { reason: "RRO_IP_PEPPER_MISSING", scope: "isolate" });
     }
-    return { allowed: true, skipped: "no_pepper" };
+    const fb = await rroCacheRateLimitCount(bucket, await rroFallbackIpKey(request), lim.max_hits, lim.window_minutes, now);
+    return fb.allowed ? { allowed: true, fallback: "no_pepper" } : { ...limited, fallback: "no_pepper" };
   }
   const local = await rroCacheRateLimitCount(bucket, ipHash, lim.max_hits, lim.window_minutes, now);
-  const limited = { allowed: false, retryAfterSec: rroRetryAfterSec(lim.window_minutes, now) };
   if (!local.allowed) return limited;
   const db = env && env.RRO_CHECKOUT_DB;
   if (db && local.count % lim.flush_every === 0) {
@@ -247,7 +277,7 @@ async function rroPublicRateLimit(request, env, bucket, nowMs) {
         return limited;
       }
     } catch (err) {
-      console.log(JSON.stringify({ event: "rro_public_rate_limit_d1_error", error: String((err && err.message) || err).slice(0, 200) }));
+      rroAlert("public_rate_limit_d1_error", { error: String((err && err.message) || err).slice(0, 200) });
     }
   }
   return { allowed: true };
@@ -322,6 +352,8 @@ function rroResetIsolateStateForTests() {
   RRO_LOOKUP_LIMITER.clear();
   RRO_LOOKUP_INFLIGHT.clear();
   RRO_NOT_PAID_CACHE.clear();
+  RRO_PUBLIC_LIMIT_NO_PEPPER_LOGGED = false;
+  RRO_ISOLATE_SALT = null;
 }
 
 // P39 / P24: Content-Security-Policy for HTML pages. The allowed inline scripts are hashed from the TRUSTED
@@ -666,6 +698,9 @@ export {
   RRO_PAID_CACHE_TTL_MS,
   RRO_NOT_PAID_CACHE_TTL_MS,
   RRO_STRIPE_LOOKUP_GLOBAL_CAP,
+  RRO_STRIPE_LOOKUP_SESSION_CAP,
+  RRO_ALERT_EVENT,
+  rroAlert,
   RRO_PUBLIC_RATE_LIMIT,
   RRO_IP_HASH_RETENTION_HOURS,
   RRO_PREVIEW_COOKIE,

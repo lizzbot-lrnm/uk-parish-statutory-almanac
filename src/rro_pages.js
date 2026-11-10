@@ -2,6 +2,9 @@
 import {
   RRO_LOOKUP_RATE_LIMIT,
   RRO_STRIPE_LOOKUP_GLOBAL_CAP,
+  RRO_STRIPE_LOOKUP_SESSION_CAP,
+  rroAlert,
+  rroHmacSha256Hex,
   RRO_PREVIEW_COOKIE,
   RRO_TEST_MODE_LABEL,
   RRO_PACK_DOWNLOAD_DAYS,
@@ -156,8 +159,8 @@ function rroSessionWithinWindow(session) {
 // NO D1 write (random-id floods only cost bounded reads, as in G1), (5) P3: for a known session, the same
 // per-ip_hash limit as a GLOBAL D1 counter (one conditional upsert, nothing written once over the limit),
 // (6) paid-verdict cache (<=10 min), (7) P2: "not paid" verdict cache (30 s) unless the webhook has already
-// recorded 'paid', (8) P2: global Stripe-lookup cap (D1, all IPs) for sessions NOT yet recorded as paid, so
-// unpaid-session polling cannot exhaust it for real buyers, (9) only then GET the session from Stripe.
+// recorded 'paid', (8) P2/P41: per-session Stripe-lookup budget, then a global ceiling (both D1, all IPs) for sessions NOT
+// yet recorded as paid, so unpaid-session polling cannot exhaust it for real buyers, (9) only then GET the session from Stripe.
 // Internal error codes are mapped to generic public ones (P16) by the routes.
 async function rroLoadPaidSession(env, sessionId, request) {
   if (!RRO_SESSION_ID_RE.test(String(sessionId || ""))) return { ok: false, status: 400, error: "INVALID_SESSION_ID" };
@@ -190,8 +193,17 @@ async function rroLoadPaidSession(env, sessionId, request) {
   if (!paidInD1) {
     const neg = await rroNotPaidCacheGet(sessionId);
     if (neg) return { ok: false, status: neg.status, error: neg.error, cachedVerdict: true };
+    // P41 (option ii): per-session Stripe budget first, keyed by a peppered hash (no raw session id in
+    // the counter table), then the larger global ceiling. Over either: nothing is written, an alert is logged.
+    const scap = RRO_STRIPE_LOOKUP_SESSION_CAP;
+    const sessionKey = (await rroHmacSha256Hex(rroIpPepper(env), "stripe_session:" + sessionId)).slice(0, 32);
+    if (!(await rroD1CounterHit(db, "stripe_lookup_session", sessionKey, scap.max_hits, scap.window_minutes))) {
+      rroAlert("stripe_lookup_session_cap_hit", { mode: sessionMode, max: scap.max_hits, window_minutes: scap.window_minutes });
+      return { ok: false, status: 429, error: "STRIPE_LOOKUP_SESSION_CAP", retryAfterSec: rroRetryAfterSec(scap.window_minutes) };
+    }
     const cap = RRO_STRIPE_LOOKUP_GLOBAL_CAP;
     if (!(await rroD1CounterHit(db, "stripe_lookup", "global", cap.max_hits, cap.window_minutes))) {
+      rroAlert("stripe_lookup_global_cap_hit", { mode: sessionMode, max: cap.max_hits, window_minutes: cap.window_minutes });
       return { ok: false, status: 503, error: "STRIPE_LOOKUP_GLOBAL_CAP" };
     }
   }
@@ -214,6 +226,8 @@ async function rroLoadPaidSession(env, sessionId, request) {
   // Stripe's own livemode flag must agree with the key mode (same check as the webhook).
   if (Boolean(session.livemode) !== (sessionMode === "live")) return { ok: false, status: 502, error: "SESSION_MODE_MISMATCH" };
   if (!rroSessionWithinWindow(session)) return { ok: false, status: 410, error: "DOWNLOAD_EXPIRED" };
+  // P41: Stripe says paid but no verified webhook has recorded it (late, or a delivery/processing failure).
+  if (!paidInD1) rroAlert("webhook_paid_row_missing", { mode: sessionMode });
   await rroRecordPaid(db, session);
   const minimal = rroPaidCacheProject(session);
   rroPaidCachePut(sessionId, minimal);
