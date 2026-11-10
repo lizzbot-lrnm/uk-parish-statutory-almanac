@@ -452,15 +452,21 @@ async function rroPublicApiRateLimitResponse(request, env, url) {
 }
 
 // P16: an unexpected exception never reaches the client as a stack, message or Cloudflare error page.
-// The visitor gets a generic no-store 500; the log gets the path and the error message only (no query
-// string, headers, body or stack).
+// The visitor gets a generic no-store 500 with the same CORS headers as the other public API responses
+// (worker.js corsHeaders), so cross-origin API callers can read the INTERNAL_ERROR body; the log gets the
+// path and the error message only (no query string, headers, body or stack).
+const RRO_API_CORS_HEADERS = Object.freeze({
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept, MCP-Protocol-Version",
+});
 function rroUnhandledErrorResponse(err, request) {
   let path = "";
   try {
     path = new URL(request.url).pathname.slice(0, 120);
   } catch (_) {}
   console.log(JSON.stringify({ event: "unhandled_error", path, error: String((err && err.message) || err).slice(0, 200) }));
-  return rroJson({ status: "error", error: "INTERNAL_ERROR" }, 500);
+  return rroJson({ status: "error", error: "INTERNAL_ERROR" }, 500, RRO_API_CORS_HEADERS);
 }
 
 export { rroHandleCheckoutRoutes, rroRenderRroPage, rroPublicApiRateLimitResponse, rroUnhandledErrorResponse, RRO_PUBLIC_API_PATHS, RRO_FAQ };
