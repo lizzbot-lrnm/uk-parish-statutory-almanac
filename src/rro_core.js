@@ -39,6 +39,11 @@ const RRO_CHECKOUT_DAILY_WINDOW_MINUTES = 24 * 60;
 // P68: volume alert (throttled by rroAlert) once the day's count reaches this ABSOLUTE number of starts
 // (or the cap, if a configured cap is lower). Cap hits are escalated (escalate:true) and throttled (P75).
 const RRO_CHECKOUT_DAILY_ALERT_STARTS = 20;
+// P76: per-ip_hash (one IPv6 /64 or one IPv4, same peppered keying as the 10-minute limit) ceiling on new
+// checkout starts per UTC day, D1-counted in rro_rate_counters (bucket checkout_ip_daily, key = ip_hash,
+// kept 48 h like checkout_daily). Without it one /64 at 5 per 10 min could use the whole global cap.
+// Over the limit, or on a counter error: fail closed, no Stripe call. Paid buyers' lookups never touch it.
+const RRO_CHECKOUT_IP_DAILY_LIMIT = 20;
 let RRO_CAP_INVALID_ALERTED = false;
 function rroCheckoutDailyCap(env) {
   const raw = env && env.RRO_CHECKOUT_DAILY_CAP;
@@ -529,7 +534,8 @@ async function rroPurgeIpHashes(db, nowMs) {
   // P15: aggregate counter rows are only needed for their 10-minute window.
   // P53: the daily checkout counter must survive the hourly purge for its whole UTC day (kept 48 h).
   const dayCutoff = new Date(now - 48 * 3600000).toISOString();
-  await db.prepare("DELETE FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket != 'checkout_daily' OR window_start_utc < ?2)").bind(hitCutoff, dayCutoff).run();
+  // P76: the per-ip_hash daily row is kept the same 48 h.
+  await db.prepare("DELETE FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket NOT IN ('checkout_daily', 'checkout_ip_daily') OR window_start_utc < ?2)").bind(hitCutoff, dayCutoff).run();
 }
 
 // Opportunistic retention on the webhook write path: at most `limit` rows per table per call.
@@ -544,7 +550,7 @@ async function rroPurgeIpHashesBounded(db, limit, nowMs) {
     .run();
   await db.prepare("DELETE FROM rro_rate_hits WHERE id IN (SELECT id FROM rro_rate_hits WHERE created_at_utc < ?1 LIMIT ?2)").bind(hitCutoff, n).run();
   await db
-    .prepare("DELETE FROM rro_rate_counters WHERE rowid IN (SELECT rowid FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket != 'checkout_daily' OR window_start_utc < ?3) LIMIT ?2)")
+    .prepare("DELETE FROM rro_rate_counters WHERE rowid IN (SELECT rowid FROM rro_rate_counters WHERE window_start_utc < ?1 AND (bucket NOT IN ('checkout_daily', 'checkout_ip_daily') OR window_start_utc < ?3) LIMIT ?2)")
     .bind(hitCutoff, n, new Date(now - 48 * 3600000).toISOString())
     .run();
 }
@@ -769,6 +775,7 @@ export {
   RRO_CHECKOUT_DAILY_CAP_MAX,
   RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
   RRO_CHECKOUT_DAILY_ALERT_STARTS,
+  RRO_CHECKOUT_IP_DAILY_LIMIT,
   rroCheckoutDailyCap,
   rroD1CounterHitCount,
   RRO_LOOKUP_RATE_LIMIT,

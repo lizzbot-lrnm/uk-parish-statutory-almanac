@@ -21,6 +21,12 @@ let sidN = 0;
 const stripeOk = () => mockStripe(() => { const id = "cs_test_P53SESSION" + String(++sidN).padStart(10, "0"); return jsonResp({ id, url: "https://checkout.stripe.com/c/pay/" + id }); });
 const alerts = (logs) => logs.map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter((j) => j && j.event === RRO_ALERT_EVENT);
 const daily = (e) => counters(e).find((c) => c.bucket === "checkout_daily");
+// A D1 wrapper whose counter upsert throws for one bucket only (other statements hit the real fake D1).
+const failBucket = (db, bucket) => ({ ...db, prepare: (sql) => {
+  const st = db.prepare(sql);
+  if (!(/rro_rate_counters/.test(sql) && /^\s*INSERT/i.test(sql))) return st;
+  return { bind: (...a) => (a[0] === bucket ? { first: async () => { throw new Error("D1_ERROR: write failed"); } } : st.bind(...a)) };
+} });
 
 test("P68: the cap is a named default (500), overridable by a plain var, and never 'unlimited' on bad input", () => {
   assert.equal(RRO_CHECKOUT_DAILY_CAP_DEFAULT, 500);
@@ -97,7 +103,7 @@ test("P53: a counter error fails closed for a new session (503, no Stripe call)"
   const e = env();
   const db = e.RRO_CHECKOUT_DB;
   for (const s of RRO_CHECKOUT_SCHEMA) db._db.exec(s);
-  e.RRO_CHECKOUT_DB = { ...db, prepare: (sql) => (/rro_rate_counters/.test(sql) && /^\s*INSERT/i.test(sql) ? { bind: () => ({ first: async () => { throw new Error("D1_ERROR: write failed"); } }) } : db.prepare(sql)) };
+  e.RRO_CHECKOUT_DB = failBucket(db, "checkout_daily");
   noStripe();
   let r;
   const logs = await captureLogs(async () => { r = await worker.fetch(checkout(), e); });
