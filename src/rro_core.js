@@ -43,7 +43,9 @@ let RRO_CAP_INVALID_ALERTED = false;
 function rroCheckoutDailyCap(env) {
   const raw = env && env.RRO_CHECKOUT_DAILY_CAP;
   const s = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
-  if (raw === undefined || raw === null || s === "") return RRO_CHECKOUT_DAILY_CAP_DEFAULT; // unset: no alert
+  // P77: only undefined, null or "" count as unset. Anything else that fails validation (true, "  ", objects,
+  // "abc", 0, ...) alerts once below.
+  if (raw === undefined || raw === null || raw === "") return RRO_CHECKOUT_DAILY_CAP_DEFAULT; // unset: no alert
   const n = /^[0-9]{1,5}$/.test(s) ? Number(s) : NaN;
   if (n >= 1 && n <= RRO_CHECKOUT_DAILY_CAP_MAX) return n;
   // P69: never fall back silently. One line per isolate; the value itself is not logged (length/type only).

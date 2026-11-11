@@ -165,3 +165,21 @@ test("P75: two capped calls produce one log line; the next line after the quiet 
   assert.equal(hits[0].suppressed, 1);
   assert.equal(stripeCalls.length, 1, "Stripe called only for the one admitted start");
 });
+
+test("P77: boolean true and whitespace-only caps are invalid (alert once, type/length only), not 'unset'", async () => {
+  for (const [bad, type, len] of [[true, "boolean", 4], ["   ", "string", 3], [{}, "object", 15], [false, "boolean", 5]]) {
+    rroResetIsolateStateForTests();
+    const logs = await captureLogs(async () => {
+      assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: bad }), 500);
+      assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: bad }), 500);
+    });
+    const inv = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_invalid");
+    assert.equal(inv.length, 1, JSON.stringify(bad));
+    assert.equal(inv[0].value_type, type);
+    assert.equal(inv[0].value_length, len);
+    assert.equal(inv[0].value, undefined, "the value itself is never logged");
+  }
+  rroResetIsolateStateForTests();
+  const logs = await captureLogs(async () => { for (const unset of [undefined, null, ""]) assert.equal(rroCheckoutDailyCap({ RRO_CHECKOUT_DAILY_CAP: unset }), 500); });
+  assert.equal(alerts(logs).length, 0, "only undefined, null and empty string are 'unset'");
+});
