@@ -37,7 +37,7 @@ const RRO_CHECKOUT_DAILY_CAP_DEFAULT = 500;
 const RRO_CHECKOUT_DAILY_CAP_MAX = 10000;
 const RRO_CHECKOUT_DAILY_WINDOW_MINUTES = 24 * 60;
 // P68: volume alert (throttled by rroAlert) once the day's count reaches this ABSOLUTE number of starts
-// (or the cap, if a configured cap is lower). Cap hits are escalated and never throttled (see rroAlert).
+// (or the cap, if a configured cap is lower). Cap hits are escalated (escalate:true) and throttled (P75).
 const RRO_CHECKOUT_DAILY_ALERT_STARTS = 20;
 let RRO_CAP_INVALID_ALERTED = false;
 function rroCheckoutDailyCap(env) {
@@ -272,8 +272,10 @@ const RRO_ALERT_STATE = new Map();
 const RRO_ALERT_STATE_MAX_KEYS = 64;
 // P63: alerts about a real buyer's money are never throttled. They can only follow a verified (signed)
 // webhook or a Stripe-confirmed paid session, so an outsider cannot flood them.
-// P68: checkout_daily_cap_hit is escalated the same way (it can only follow the per-IP limit and the D1 cap check).
-const RRO_ALERT_UNTHROTTLED = Object.freeze(new Set(["webhook_record_failed", "pack_record_failed", "webhook_paid_row_missing", "checkout_daily_cap_hit"]));
+// P75: checkout_daily_cap_hit is NOT on this list. It is reachable from a public endpoint, so unthrottled it
+// would be a log-flood lever; the 60 s throttle still emits the first hit at once (escalate:true) and then
+// carries a suppressed count.
+const RRO_ALERT_UNTHROTTLED = Object.freeze(new Set(["webhook_record_failed", "pack_record_failed", "webhook_paid_row_missing"]));
 function rroAlert(alert, fields, nowMs) {
   const key = String(alert);
   if (RRO_ALERT_UNTHROTTLED.has(key)) {

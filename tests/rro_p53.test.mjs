@@ -55,7 +55,7 @@ test("P69: an invalid RRO_CHECKOUT_DAILY_CAP logs ONE alert per isolate and stil
   rroResetIsolateStateForTests();
 });
 
-test("P68: volume alert at an absolute 20 starts (throttled); over the cap -> 503, no Stripe call, cap hits escalate unthrottled", async () => {
+test("P68/P75: volume alert at an absolute 20 starts (throttled); over the cap -> 503, no Stripe call, cap hits escalate but are throttled", async () => {
   rroResetIsolateStateForTests();
   const e = env({ RRO_CHECKOUT_DAILY_CAP: "25" });
   stripeOk();
@@ -75,8 +75,8 @@ test("P68: volume alert at an absolute 20 starts (throttled); over the cap -> 50
   }
   assert.equal(stripeCalls.length, 25, "no Stripe call over the cap");
   const hits = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_hit");
-  assert.equal(hits.length, 3, "every cap hit is logged (unthrottled)");
-  assert.ok(hits.every((h) => h.cap === 25 && h.escalate === true && h.suppressed === undefined));
+  assert.equal(hits.length, 1, "P75: three capped calls within 60 s give ONE line");
+  assert.ok(hits[0].cap === 25 && hits[0].escalate === true);
   const row = daily(e);
   assert.equal(row.key_hash, "global");
   assert.equal(row.n, 25, "nothing written over the cap");
@@ -144,4 +144,24 @@ test("P53: paid buyers are never affected: with the day's cap used up the pack s
   mockStripe(() => jsonResp(paidSession(sid)));
   assert.equal((await worker.fetch(get("/api/rro/pack?session_id=" + sid), e)).status, 200);
   assert.equal(daily(e).n, 1, "pack lookups never touch the daily counter");
+});
+
+test("P75: two capped calls produce one log line; the next line after the quiet window carries the suppressed count", async () => {
+  rroResetIsolateStateForTests();
+  const e = env({ RRO_CHECKOUT_DAILY_CAP: "1" });
+  stripeOk();
+  const t0 = Date.UTC(2027, 1, 3, 9);
+  await withNow(t0, async () => assert.equal((await worker.fetch(checkout(), e)).status, 200));
+  let logs = await captureLogs(async () => {
+    await withNow(t0 + 1000, async () => assert.equal((await worker.fetch(checkout(), e)).status, 503));
+    await withNow(t0 + 2000, async () => assert.equal((await worker.fetch(checkout(), e)).status, 503));
+  });
+  let hits = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_hit");
+  assert.equal(hits.length, 1, "one line for two capped calls");
+  assert.equal(hits[0].escalate, true);
+  logs = await captureLogs(() => withNow(t0 + 70000, async () => assert.equal((await worker.fetch(checkout(), e)).status, 503)));
+  hits = alerts(logs).filter((x) => x.alert === "checkout_daily_cap_hit");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].suppressed, 1);
+  assert.equal(stripeCalls.length, 1, "Stripe called only for the one admitted start");
 });
