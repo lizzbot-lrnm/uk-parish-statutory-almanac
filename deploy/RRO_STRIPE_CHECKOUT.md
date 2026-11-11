@@ -24,7 +24,7 @@ At `since + 7 days`: **`checkout_starts < 10` OR `paid == 0` → KILL** (remove 
 | `STRIPE_WEBHOOK_SECRET` | Worker secret | `whsec_…` from the Stripe webhook endpoint below. Leading/trailing whitespace or a newline is trimmed (as for `STRIPE_SECRET_KEY`); it must then be `whsec_`-shaped (`whsec_` + at least 16 of `A-Za-z0-9_+/=-`); anything else counts as missing. Checkout fails closed without it. |
 | `RRO_PREVIEW_SECRET` | Worker secret | **Required for test preview.** HMAC key for the preview link token and cookie (≥24 chars). Missing → preview disabled (fail closed). |
 | `RRO_IP_PEPPER` | Worker secret | **Required** (T3). Dedicated HMAC pepper for `ip_hash` (≥16 chars, must not equal the whsec). Without it, checkout returns `503 CHECKOUT_NOT_CONFIGURED`, while `/api/rro/pack` and `/rro/pack/success` return the generic `503 UNAVAILABLE` (P16; the internal reason is logged only). Generate locally and put it directly: `openssl rand -hex 32 \| wrangler secret put RRO_IP_PEPPER --name parish-statutory-almanac` (never echo/paste the value). |
-| `RRO_CHECKOUT_DAILY_CAP` | Plain var (optional) | P53: global ceiling on **new** Stripe Checkout sessions per UTC day, all IPs together. The default is **50** new checkout sessions per UTC day (`RRO_CHECKOUT_DAILY_CAP_DEFAULT` in `src/rro_core.js`). Set an integer from 1 to 10000 to raise it; anything else falls back to 50, never to unlimited. Over the cap, or on a counter error, checkout returns a generic `503 CHECKOUT_UNAVAILABLE` and Stripe is not called. Paid buyers' pack and success lookups never touch it. |
+| `RRO_CHECKOUT_DAILY_CAP` | Plain var (optional) | P53/P68: global ceiling on **new** Stripe Checkout sessions per UTC day, all IPs together. The default is **500** new checkout sessions per UTC day (`RRO_CHECKOUT_DAILY_CAP_DEFAULT` in `src/rro_core.js`). Set an integer from 1 to 10000 to change it. Any other value falls back to 500, never to unlimited, and (P69) logs a one-time `checkout_daily_cap_invalid` alert per isolate; the value itself is not logged, only its type and length. Only an absent, null or empty value counts as unset (P77): `true` or whitespace-only values are invalid and alert. Over the cap, or on a counter error, checkout returns a generic `503 CHECKOUT_UNAVAILABLE` and Stripe is not called. Paid buyers' pack and success lookups never touch it. |
 | `RRO_TELEMETRY_TOKEN` | Worker secret | Optional bearer for full telemetry (≥24 chars). Unset → only the minimal public view exists. Same `openssl rand -hex 32 \| wrangler secret put …` pattern. |
 | `RRO_STRIPE_LIVE_ENABLED` | plain var | Exactly `true` (case-sensitive, no whitespace; T4) **only after the live-mode security review passes and the site owner approves**. `TRUE`, `True`, `1` stay blocked. |
 | `RRO_CHECKOUT_LIVE_SINCE` | plain var | ISO-8601 UTC, set at live launch (Day-7 clock). |
@@ -70,10 +70,11 @@ Alert on any `rro_alert` from a Workers Logs query or a Logpush filter, and also
 
 **P53, daily checkout ceiling:** this is `rro_rate_counters`, bucket `checkout_daily`, key `global`, with one row per UTC day. It is counted with the same conditional upsert, after the per-IP limit, so one IP's refused attempts never use up the day.
 - The row is kept 48 h, because the hourly purge skips it until then.
-- `checkout_daily_volume_high` is logged once the day reaches 50% of the cap, and `checkout_daily_cap_hit` at the cap. Both are throttled as in P55.
+- **P76, per-IP daily limit:** each ip_hash (one IPv6 /64 or one IPv4 address, with the same peppered keying as the 10-minute limit) may start at most **20** checkout sessions per UTC day (`RRO_CHECKOUT_IP_DAILY_LIMIT`). It is counted in `rro_rate_counters`, bucket `checkout_ip_daily`, key = ip_hash, kept 48 h. The check runs after the 10-minute per-IP limit and **before** the global cap, so one /64's refused starts never use the day's global budget. Over the limit it returns `429 RATE_LIMITED` with `Retry-After` until the next UTC day. On a counter error it returns `503 CHECKOUT_UNAVAILABLE` (fail closed). In both cases Stripe is not called, and paid buyers' pack and success lookups never touch it. The `checkout_ip_daily_limit_hit` alert is throttled.
+- **P68 alerts:** `checkout_daily_volume_high` fires at an absolute **20** checkout starts in a UTC day (or at the cap, if a configured cap is lower) and is throttled to one line per 60 s per isolate. `checkout_daily_cap_hit` is escalated (`escalate: true`) but, since P75, throttled like other alerts. The first cap hit logs at once, and later lines carry `suppressed: N`. That keeps a public endpoint from flooding Workers Logs past the daily limit and hiding the money-path alerts.
 - `checkout_daily_counter_failed` is logged on a counter error (fail closed).
 
-**P55, throttling:** each alert type logs at most once per 60 s per isolate. The next line after a quiet window carries `suppressed: N`. Throttling is per type, so a flood of one type (for example unsigned webhooks) never hides another (for example `webhook_record_failed`). Workers Logs must be enabled on the script for these lines to be kept; at deploy 8 it was not.
+**P55, throttling:** each alert type logs at most once per 60 s per isolate. The next line after a quiet window carries `suppressed: N`. Throttling is per type, so a flood of one type (for example unsigned webhooks) never hides another (for example `webhook_record_failed`). The exceptions, logged every time, are `webhook_record_failed`, `pack_record_failed` and `webhook_paid_row_missing` (P63). Since P75, `checkout_daily_cap_hit` is throttled again. Workers Logs must be enabled on the script for these lines to be kept. It has been enabled since 10 Nov 2026 (invocation logs off), and from deploy 9 the deploy script enforces that (P61).
 
 **P51, paid path and D1 write failures:** once Stripe has confirmed a session as paid, the buyer always gets the pack:
 - recording `paid` is best-effort, and a failure only logs the `pack_record_failed` alert. The Stripe-retried webhook records it later;
@@ -128,8 +129,27 @@ All must be done, plus a fresh security review, owner approval and a separate li
 - **Accepted LOW:** the public `/api/rro/telemetry` keeps `mode` (`test`/`live`/`unavailable`) and `price_gbp`. They are the documented public contract the smoke test reads, and the price is already shown on the page.
 
 
-### Deploy script safety (P61, P63, P64)
+### Deploy script safety (P61, P63, P64, P78)
 
 - **P64:** `deploy/build_cf_execute.mjs` reads the rollback target (the version serving 100%) before writing anything. If it can't read it, or no single version is at 100%, it refuses and writes nothing. There is no "roll back by hand" fallback.
 - **P61:** after upload, the script sets the Worker's Workers Logs config through `script-settings`: `observability.enabled=true`, `head_sampling_rate=1`, `redact_query_string=true`, `logs.invocation_logs=false` (no visitor IP, user-agent or geo in stored logs), and `traces.enabled=false`. It then reads the config back. A mismatch, or a failed write or read, stops the deploy before the cron step and rolls back to the previous version. Script-level settings aren't versioned, so re-check them by hand after that rollback. To turn logs off entirely, PATCH `script-settings` with `{"observability":{"enabled":false}}`.
 - **P63:** `webhook_record_failed`, `pack_record_failed` and `webhook_paid_row_missing` alerts are never throttled. Every one is logged.
+- **P78, the cron step fails:** the schedules step (`PUT .../schedules`, then the read-back that requires `0 * * * *`) runs last, after the upload, the names check and the observability check. If it throws, the script does **not** roll back the code. Schedules are script-level settings that persist across versions, so rolling back the code wouldn't repair the cron. Instead:
+  1. Re-run only the schedules step with the fleet Cloudflare connector: `PUT /accounts/{id}/workers/scripts/parish-statutory-almanac/schedules` with the existing crons plus `0 * * * *`.
+  2. Read it back with `GET .../schedules` and confirm `0 * * * *` is present.
+  3. Record both in the deploy record. If it still fails, the hourly `ip_hash` purge isn't running: roll back the code to the previous version and stop until the cron is fixed.
+
+### Bootstrapping a brand-new Worker (the deploy script can't)
+
+`deploy/build_cf_execute.mjs` is made for updating an existing Worker. It **refuses** to deploy a Worker that doesn't exist yet, or one that has never served a version, for two reasons:
+
+1. The P40 preflight requires the secret **name** `RRO_IP_PEPPER` to be bound already. The script never writes secrets.
+2. The P64 preflight requires a readable rollback target, which means one version serving 100%.
+
+Both refusals happen before anything is written. That is intended, so don't weaken either check to get a first deploy through. To bootstrap a new Worker (for example in a new account, or after a delete), do this once, by hand, with the fleet Cloudflare token and the sign-off of the reviewer and owner:
+
+1. Upload a minimal placeholder Worker under the target script name, with **no route** and no custom domain. A module that returns `503` for every request is enough. This creates the script and a first version at 100%.
+2. Bind the secrets with `PUT /accounts/{id}/workers/scripts/{script}/secrets` (`type: secret_text`): `RRO_IP_PEPPER`, and `RRO_TELEMETRY_TOKEN` if used. Take the values from the secret store and never print or commit them. Stripe secrets and `RRO_STRIPE_LIVE_ENABLED` stay unset.
+3. Read back the names only (`GET .../settings`) and the deployments (`GET .../deployments`, one version at 100%).
+4. Run the normal deploy: `node deploy/build_cf_execute.mjs "<message>"`. The script creates or binds the D1 database, uploads, re-checks the secret names, sets and verifies the P61 observability config, and registers the cron. Its rollback target is the placeholder.
+5. Run the post-checks. Only after they pass, attach the route (`parish.technoplusit.co.uk/*`) and record its id and the rollback (delete the route) in the deploy record.

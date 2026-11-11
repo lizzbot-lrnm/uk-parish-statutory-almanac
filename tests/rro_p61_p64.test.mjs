@@ -3,6 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { rroAlert, rroResetIsolateStateForTests, RRO_ALERT_EVENT, RRO_ALERT_UNTHROTTLED } from "../src/rro_core.js";
 import { captureLogs } from "./rro_batch_helpers.mjs";
 
@@ -29,7 +30,7 @@ test("P63: webhook_record_failed, pack_record_failed and webhook_paid_row_missin
 const build = () => execFileSync(process.execPath, [new URL("../deploy/build_cf_execute.mjs", import.meta.url).pathname, "p61 test"], { encoding: "utf8" });
 const NAMES = [{ type: "secret_text", name: "RRO_IP_PEPPER" }, { type: "secret_text", name: "RRO_TELEMETRY_TOKEN" }];
 export const GOOD_OBS = { enabled: true, head_sampling_rate: 1, redact_query_string: true, logs: { enabled: true, head_sampling_rate: 1, persist: true, invocation_logs: false }, traces: { enabled: false, persist: true, head_sampling_rate: 1 } };
-function runDeploy(src, { deps = { success: true, result: { deployments: [{ id: "d-prev", versions: [{ version_id: "v-prev", percentage: 100 }] }] } }, obsAfter = GOOD_OBS, patchOk = true } = {}) {
+function runDeploy(src, { deps = { success: true, result: { deployments: [{ id: "d-prev", versions: [{ version_id: "v-prev", percentage: 100 }] }] } }, obsAfter = GOOD_OBS, patchOk = true, rollbackPost = null } = {}) {
   const calls = [];
   let schedules = [];
   const cloudflare = { request: async ({ method, path, body }) => {
@@ -38,7 +39,7 @@ function runDeploy(src, { deps = { success: true, result: { deployments: [{ id: 
     if (path.endsWith("/settings")) return { success: true, result: { bindings: NAMES } };
     if (path.endsWith("/d1/database")) return { success: true, result: [{ name: "parish-rro-checkout", uuid: "u-1" }] };
     if (path.endsWith("/deployments") && method === "GET") return typeof deps === "function" ? deps() : deps;
-    if (path.endsWith("/deployments") && method === "POST") return { success: true, result: { id: "d-rb" } };
+    if (path.endsWith("/deployments") && method === "POST") return rollbackPost ? rollbackPost() : { success: true, result: { id: "d-rb" } };
     if (path.endsWith("/schedules") && method === "PUT") { schedules = body; return { success: true, result: { schedules } }; }
     if (path.endsWith("/schedules")) return { success: true, result: { schedules } };
     return { success: true, result: { etag: "e" } };
@@ -106,4 +107,23 @@ test("P61: any observability mismatch or failed write stops the deploy and rolls
     assert.deepEqual(rb.body.versions, [{ version_id: "v-prev", percentage: 100 }]);
     assert.equal(d.calls.some((c) => c.m === "PUT" && c.p.endsWith("/schedules")), false, "stopped before crons");
   }
+});
+
+// ---------------------------------------------------------------- P70
+test("P70: if the rollback call itself throws or fails, the error shows ROLLBACK FAILED together with the original reason", async () => {
+  const src = build();
+  const bad = { obsAfter: { ...GOOD_OBS, logs: { ...GOOD_OBS.logs, invocation_logs: true } } };
+  for (const rollbackPost of [() => { throw new Error("POST /deployments: HTTP 503 network down"); }, () => ({ success: false, errors: [{ code: 10013, message: "nope" }] })]) {
+    const d = runDeploy(src, { ...bad, rollbackPost });
+    await assert.rejects(d.done, (e) => /observability mismatch: logs\.invocation_logs/.test(e.message) && /STOP, ROLLBACK FAILED \(/.test(e.message) && /roll back to v-prev by hand/.test(e.message));
+    assert.equal(d.calls.filter((c) => c.m === "POST" && c.p.endsWith("/deployments")).length, 1, "rollback attempted once");
+  }
+  const thrown = runDeploy(src, { ...bad, rollbackPost: () => { throw new Error("HTTP 503 network down"); } });
+  await assert.rejects(thrown.done, /ROLLBACK FAILED \(HTTP 503 network down\)/);
+});
+
+test("Bootstrap: the docs say the script can't deploy a brand-new Worker and how to bootstrap one", () => {
+  const doc = readFileSync(new URL("../deploy/RRO_STRIPE_CHECKOUT.md", import.meta.url), "utf8");
+  assert.match(doc, /### Bootstrapping a brand-new Worker \(the deploy script can't\)/);
+  for (const re of [/placeholder Worker/, /\*\*no route\*\*/, /RRO_IP_PEPPER/, /rollback target/, /attach the route/]) assert.match(doc, re);
 });

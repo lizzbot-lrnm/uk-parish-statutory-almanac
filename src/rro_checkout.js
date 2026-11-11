@@ -7,7 +7,10 @@ import {
   RRO_PUBLIC_ORIGIN,
   RRO_CHECKOUT_RATE_LIMIT,
   RRO_CHECKOUT_DAILY_WINDOW_MINUTES,
-  RRO_CHECKOUT_DAILY_ALERT_FRACTION,
+  RRO_CHECKOUT_DAILY_ALERT_STARTS,
+  RRO_CHECKOUT_IP_DAILY_LIMIT,
+  rroD1CounterHit,
+  rroRetryAfterSec,
   rroCheckoutDailyCap,
   rroD1CounterHitCount,
   RRO_PAID_CACHE_TTL_MS,
@@ -76,6 +79,19 @@ async function rroHandleCheckoutCreate(request, env) {
   if (!allowed) {
     return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(RRO_CHECKOUT_RATE_LIMIT.window_minutes * 60) });
   }
+  // P76: per-ip_hash daily limit, counted before the global cap so one /64's refused starts never use the
+  // day's global budget. Fail closed: over the limit or on a counter error, no Stripe call.
+  let ipDailyOk = false;
+  try {
+    ipDailyOk = await rroD1CounterHit(db, "checkout_ip_daily", ipHash, RRO_CHECKOUT_IP_DAILY_LIMIT, RRO_CHECKOUT_DAILY_WINDOW_MINUTES);
+  } catch (err) {
+    rroAlert("checkout_ip_daily_counter_failed", { mode: mode.mode, error: String((err && err.message) || err).slice(0, 200) });
+    return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
+  }
+  if (!ipDailyOk) {
+    rroAlert("checkout_ip_daily_limit_hit", { mode: mode.mode, limit: RRO_CHECKOUT_IP_DAILY_LIMIT });
+    return rroJson({ status: "error", error: "RATE_LIMITED" }, 429, { "Retry-After": String(rroRetryAfterSec(RRO_CHECKOUT_DAILY_WINDOW_MINUTES)) });
+  }
   // P53: global daily ceiling on new Stripe sessions. Fail closed: over the cap or on any counter error,
   // a generic 503 and no Stripe call. Counted after the per-IP limit, so one IP cannot burn the day's budget.
   const dailyCap = rroCheckoutDailyCap(env);
@@ -87,10 +103,10 @@ async function rroHandleCheckoutCreate(request, env) {
     return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
   }
   if (!dailyN) {
-    rroAlert("checkout_daily_cap_hit", { mode: mode.mode, cap: dailyCap });
+    rroAlert("checkout_daily_cap_hit", { mode: mode.mode, cap: dailyCap, escalate: true });
     return rroJson({ status: "error", error: "CHECKOUT_UNAVAILABLE" }, 503);
   }
-  if (dailyN >= Math.ceil(dailyCap * RRO_CHECKOUT_DAILY_ALERT_FRACTION)) {
+  if (dailyN >= Math.min(RRO_CHECKOUT_DAILY_ALERT_STARTS, dailyCap)) {
     rroAlert("checkout_daily_volume_high", { mode: mode.mode, n: dailyN, cap: dailyCap });
   }
   await rroPurgeIpHashes(db);
